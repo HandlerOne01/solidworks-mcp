@@ -168,7 +168,7 @@ public sealed class HelixResult : ToolResult
 /// (profile mark 1, path 4, guides 2), the loft (profiles mark 1 in order, guides 2) and the helix. Best guesses (see
 /// the tests): cut sweeps and lofts, circular profiles, twist, the draft's marks, the rib and the cosmetic thread.
 /// </summary>
-public sealed class AdvancedFeatureService(SwSession session)
+public sealed partial class AdvancedFeatureService(SwSession session)
 {
     private const double PosTol = 2e-6;     // m: positions read back from SOLIDWORKS geometry
     private const double OnFaceTol = 1e-5;  // m: loft-profile points on the loft's faces (0.01 mm)
@@ -382,7 +382,7 @@ public sealed class AdvancedFeatureService(SwSession session)
     private sealed record PathInfo(string Label, Func<IModelDoc2, int, bool> Select, double Length, bool Straight, Vec3? Dir,
         Vec3? Start, Vec3? End, bool Closed, string? Sketch);
 
-    private static PathInfo PathOf(IModelDoc2 d, Resolved r, string arg)
+    private static PathInfo PathOf(IModelDoc2 d, Resolved r, string arg, bool requireCompleteSketch = false)
     {
         switch (r.Obj)
         {
@@ -395,6 +395,8 @@ public sealed class AdvancedFeatureService(SwSession session)
             case IFeature f when r.Kind == EntityKind.Sketch && f.Specific() is ISketch sk:
             {
                 var segs = SketchSegs(sk, out _);
+                if (requireCompleteSketch && segs.Count != sk.Segments().Count(s => !s.ConstructionGeometry))
+                    throw SwException.InvalidArgument($"'{arg}' ({r.Label}) contains a sketch segment that cannot be verified.");
                 if (segs.Count == 0) throw SwException.InvalidArgument($"'{arg}' ({r.Label}) has no segments (construction geometry doesn't count).");
                 var set = AdvancedFeatureLogic.Chains(segs);
                 if (set.Branched || set.Chains.Count != 1)
@@ -525,7 +527,7 @@ public sealed class AdvancedFeatureService(SwSession session)
 
                 var outcome = BodyKit.Verify(ctx, d, before, SurfaceLoftSpec, (main, after, checks) =>
                 {
-                    var problems = LoftProfileMisses(main, sections);
+                    var problems = ProfileMisses(main, sections);
                     if (after.Bodies != before.Bodies + 1 || after.SolidBodies != before.SolidBodies)
                         problems.Add("expected one new surface body and an unchanged solid count");
                     if (problems.Count == 0)
@@ -557,7 +559,7 @@ public sealed class AdvancedFeatureService(SwSession session)
             checks.Add("profiles not checked (a cut keeps only what lies inside the body)");
             return [];
         }
-        var misses = LoftProfileMisses(main, sections);
+        var misses = ProfileMisses(main, sections);
         if (misses.Count == 0)
         {
             checks.Add($"the loft's faces pass through all {sections.Count} profiles");
@@ -570,17 +572,17 @@ public sealed class AdvancedFeatureService(SwSession session)
         return [];
     }
 
-    private static List<string> LoftProfileMisses(IFeature main, List<(string Label, List<Vec3> Points)> sections)
+    private static List<string> ProfileMisses(IFeature main, List<(string Label, List<Vec3> Points)> sections)
     {
         var faces = FeatureFaces(main);
-        if (faces.Count == 0) return ["the loft has no faces to verify"];
+        if (faces.Count == 0) return ["the feature has no faces to verify"];
         var misses = new List<string>();
         foreach (var (label, points) in sections)
         {
             double worst = 0;
             foreach (var point in points)
                 worst = Math.Max(worst, faces.Min(f => Topology.DistanceToFace(f, point)));
-            if (worst > OnFaceTol) misses.Add($"{label} lies up to {F(Units.Mm(worst))} mm off the loft's faces");
+            if (worst > OnFaceTol) misses.Add($"{label} lies up to {F(Units.Mm(worst))} mm off the feature's faces");
         }
         return misses;
     }

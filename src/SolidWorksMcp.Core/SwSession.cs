@@ -1,5 +1,7 @@
 using System.Diagnostics;
+using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using SolidWorks.Interop.sldworks;
@@ -46,6 +48,7 @@ public sealed record ConnectInfo(bool Connected, bool Launched, string Revision,
 public sealed class SwSession : IDisposable
 {
     private readonly ILogger _log;
+    private readonly long? _targetStartTicks;
     private ISldWorks? _app; // STA thread only
     private volatile int _pid;
     private long _mainHwnd;
@@ -59,7 +62,13 @@ public sealed class SwSession : IDisposable
         Options = options ?? SwOptions.FromEnvironment();
         _log = loggerFactory?.CreateLogger("SolidWorksMcp.Session") ?? NullLogger.Instance;
         Dispatcher = new StaDispatcher { MaxQueueWait = Options.MaxQueueWait };
-        Journal = new PreferenceJournal(Options.DataDir);
+        string journalDir = Options.DataDir;
+        if (Options.TargetProcessId is int target)
+        {
+            _targetStartTicks = SolidWorksStartTicks(target);
+            journalDir = Path.Combine(journalDir, FormattableString.Invariant($"instance-{target}-{_targetStartTicks}"));
+        }
+        Journal = new PreferenceJournal(journalDir);
         Paths = PathPolicy.FromEnvironment(Options.DataDir);
         Watchdog = new DialogWatchdog(Dispatcher, () => ProcessId, loggerFactory?.CreateLogger("SolidWorksMcp.Watchdog"));
         // Unexpected modal dialogs (not open before the call, not covered by its rules) end the wait early.
@@ -90,6 +99,7 @@ public sealed class SwSession : IDisposable
     {
         get
         {
+            if (Options.TargetProcessId is int target) return IsTargetProcess(target) ? target : null;
             if (_pid != 0) return _pid;
             var ids = SolidWorksProcessIds();
             return ids.Count > 0 ? ids[0] : null;
@@ -105,6 +115,22 @@ public sealed class SwSession : IDisposable
             finally { foreach (var p in procs) p.Dispose(); }
         }
         catch { return []; }
+    }
+
+    private bool IsTargetProcess(int pid) => _targetStartTicks is long started && SolidWorksStartTicks(pid) == started;
+
+    private static long? SolidWorksStartTicks(int pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(pid);
+            return process.ProcessName.Equals("SLDWORKS", StringComparison.OrdinalIgnoreCase)
+                ? process.StartTime.ToUniversalTime().Ticks : null;
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception)
+        {
+            return null;
+        }
     }
 
     /// <summary>Visible SOLIDWORKS dialogs (Win32 only; never blocked by the STA thread).</summary>
@@ -211,9 +237,15 @@ public sealed class SwSession : IDisposable
             Detach();
         }
 
-        var app = TryGetRunning();
+        int? target = Options.TargetProcessId;
+        var app = target is int pid
+            ? IsTargetProcess(pid) ? TryGetRunning(pid) : null
+            : TryGetRunning();
         if (app is null)
         {
+            if (target is int expected)
+                throw new SwException(ErrorCodes.NotConnected, $"SOLIDWORKS process {expected} is unavailable over COM.",
+                    "Check that this SOLIDWORKS instance is running and uses the same Windows privilege level. Update SWMCP_SOLIDWORKS_PID if the instance changed.");
             var running = SolidWorksProcessIds();
             if (running.Count > 0)
                 throw new SwException(ErrorCodes.NotConnected,
@@ -278,6 +310,27 @@ public sealed class SwSession : IDisposable
         if (NativeMethods.CLSIDFromProgID("SldWorks.Application", out var clsid) != 0) return null;
         int hr = NativeMethods.GetActiveObject(ref clsid, IntPtr.Zero, out var obj);
         return hr == 0 ? obj as ISldWorks : null;
+    }
+
+    private static ISldWorks? TryGetRunning(int pid)
+    {
+        if (NativeMethods.CreateBindCtx(0, out var context) != 0)
+            return null;
+        context.GetRunningObjectTable(out var table);
+        if (table is null) return null;
+        table.EnumRunning(out var entries);
+        string expected = "SolidWorks_PID_" + pid.ToString(CultureInfo.InvariantCulture);
+        var moniker = new IMoniker[1];
+        while (entries.Next(1, moniker, IntPtr.Zero) == 0)
+        {
+            string name;
+            try { moniker[0].GetDisplayName(context, null!, out name); }
+            catch (COMException) { continue; }
+            if (!string.Equals(name, expected, StringComparison.OrdinalIgnoreCase)) continue;
+            return table.GetObject(moniker[0], out var instance) == 0 &&
+                instance is ISldWorks app && app.GetProcessID() == pid ? app : null;
+        }
+        return null;
     }
 
     private ISldWorks Launch()

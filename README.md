@@ -96,7 +96,7 @@ Integrity event 3077). When the exe is blocked, `tools\install.ps1` registers th
 again: it publishes a new binary, which gets a new verdict. Signed releases will avoid this.
 
 ## Tools
-164 tools in 15 toolsets. The full, current list with parameters is in [`docs/tools.md`](docs/tools.md), generated from
+166 tools in 15 toolsets. The full, current list with parameters is in [`docs/tools.md`](docs/tools.md), generated from
 the server.
 
 | Toolset | Tools |
@@ -186,6 +186,7 @@ The server sends these rules to the client as instructions, and `sw_help` explai
 | `SWMCP_QUEUE_WAIT_S` | `20` | How long a call waits for its turn before `BUSY`. |
 | `SWMCP_VBA` | `off` | `on` enables `vba_run`. |
 | `SWMCP_AUTO_LAUNCH` | `off` | Start SOLIDWORKS on the first call if it isn't running (otherwise only `sw_connect {launch:true}` does). |
+| `SWMCP_SOLIDWORKS_PID` | unset | Attach to this running SOLIDWORKS process, with a journal for that instance. Launching and fallback to other instances are disabled while set. |
 | `SWMCP_OUTPUT_DIR` | `Documents\solidworks-mcp` | Base folder for relative paths. |
 | `SWMCP_WRITE_ROOTS` | your profile; `%TEMP%`; the output folder | Extra folders the server may write to (`;`-separated). |
 | `SWMCP_ALLOW_NETWORK_PATHS` | `off` | Allow `\\server\share` paths. |

@@ -109,7 +109,9 @@ public sealed class SessionService(SwSession session)
         if (current is not null && current.ElapsedS > 2)
             return Partial($"SOLIDWORKS is busy with '{current.Name}'; document details are skipped.");
         if (session.ProcessId is null && !session.IsAttached)
-            return Partial("SOLIDWORKS is not running. Ask the user to start it, or call sw_connect with launch=true.");
+            return Partial(session.Options.TargetProcessId is int target
+                ? $"SOLIDWORKS process {target} is unavailable. Check SWMCP_SOLIDWORKS_PID."
+                : "SOLIDWORKS is not running. Ask the user to start it, or call sw_connect with launch=true.");
 
         try
         {

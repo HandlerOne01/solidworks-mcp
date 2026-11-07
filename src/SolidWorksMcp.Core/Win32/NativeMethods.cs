@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
 using System.Text;
 
 namespace SolidWorksMcp.Core.Win32;
@@ -68,6 +69,9 @@ internal static class NativeMethods
     [DllImport("oleaut32.dll")]
     public static extern int GetActiveObject(ref Guid clsid, IntPtr reserved,
         [MarshalAs(UnmanagedType.IUnknown)] out object? obj);
+
+    [DllImport("ole32.dll")]
+    public static extern int CreateBindCtx(uint reserved, out IBindCtx bindContext);
 
     [DllImport("ole32.dll")]
     public static extern int CoRegisterMessageFilter(IOleMessageFilter? newFilter, out IOleMessageFilter? oldFilter);

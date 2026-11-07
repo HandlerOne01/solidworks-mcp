@@ -1,5 +1,8 @@
+using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
 using SolidWorksMcp.Core.Com;
+using SolidWorksMcp.Core.Geometry;
+using SolidWorksMcp.Core.Model;
 using SolidWorksMcp.Core.Prefs;
 
 namespace SolidWorksMcp.Core;
@@ -54,4 +57,22 @@ internal static class TestHooks
     /// <summary>The titles of all open documents.</summary>
     public static Task<List<string>> OpenTitlesAsync(SwSession s) =>
         s.RunAsync("test_titles", ctx => ctx.App.Documents().Select(ctx.Title).ToList());
+
+    /// <summary>Optionally selects a face on an owned test document and reads the sole selected face's identity.</summary>
+    public static Task<string?> SelectedFaceAsync(SwSession s, string doc, double[]? atMm = null) =>
+        s.RunAsync("test_selected_face", ctx =>
+        {
+            var d = ctx.Doc;
+            var selection = d.Sel();
+            if (atMm is not null)
+            {
+                var face = EntityResolver.Resolve(ctx, d, new EntityRef { Type = "face", At = atMm, Strict = true }, "face", EntityKind.Face);
+                d.ClearSelection2(true);
+                if (!face.Select(d, append: false, mark: 0))
+                    throw new SwException(ErrorCodes.FeatureFailed, "Could not select the test face.");
+            }
+            return selection.GetSelectedObjectCount2(-1) == 1 && (object?)selection.GetSelectedObject6(1, -1) is IFace2 selected
+                ? ctx.Entities.IdFor(d, selected, 'F', "face")
+                : null;
+        }, atMm is null ? RunOptions.Read(doc) : RunOptions.Write(doc));
 }

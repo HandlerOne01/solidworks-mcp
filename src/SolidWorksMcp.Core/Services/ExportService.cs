@@ -8,6 +8,7 @@ using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
 using SolidWorksMcp.Core.Com;
 using SolidWorksMcp.Core.Documents;
+using SolidWorksMcp.Core.Files;
 using SolidWorksMcp.Core.Geometry;
 using SolidWorksMcp.Core.Model;
 using SolidWorksMcp.Core.Prefs;
@@ -26,6 +27,8 @@ public sealed record ExportRequest
     public string StlQuality { get; init; } = "fine";
     public double? StlDeviationMm { get; init; }
     public double? StlAngleDeg { get; init; }
+    /// <summary>Export just this visible part solid to STEP or STL.</summary>
+    public EntityRef? Body { get; init; }
     public bool Overwrite { get; init; }
     public string? Doc { get; init; }
 }
@@ -76,6 +79,7 @@ public sealed class ExportResult : ToolResult
     /// <summary>The export options that were in effect (system options are restored afterwards).</summary>
     public IReadOnlyList<string>? Settings { get; init; }
     public required ExportDetails Details { get; init; }
+    public IReadOnlyList<ResolvedInfo>? Resolved { get; init; }
     /// <summary>True when an existing file was replaced (overwrite=true).</summary>
     public bool? Replaced { get; init; }
     /// <summary>Copy of the replaced file when this server hadn't written it.</summary>
@@ -175,6 +179,8 @@ internal sealed record ExportPlan(ExportFormat Format, string Quality, bool Path
 
         if (format.Name == "step" && q.StepAp is not (203 or 214 or 242))
             throw SwException.InvalidArgument($"stepAp must be 203, 214 or 242 (got {q.StepAp}).", "214 (AUTOMOTIVE_DESIGN) is the most widely read.");
+        if (q.Body is not null && format.Name is not ("step" or "stl"))
+            throw SwException.InvalidArgument("'body' is available for STL and STEP exports.");
 
         string quality = (q.StlQuality ?? "fine").Trim().ToLowerInvariant();
         if (format.Name == "stl")
@@ -222,7 +228,8 @@ internal sealed record ExportPlan(ExportFormat Format, string Quality, bool Path
 internal static class ExportFileCheck
 {
     /// <summary>What the caller asked for; mismatches become problems.</summary>
-    internal sealed record Expect(int? StepAp = null, bool? StlBinary = null, double[]? ModelSizeMm = null);
+    internal sealed record Expect(int? StepAp = null, bool? StlBinary = null, double[]? ModelSizeMm = null,
+        bool SingleBody = false, double? BodyVolumeMm3 = null);
 
     /// <summary>Files up to this size are scanned completely (entity and triangle counts, mesh volume).</summary>
     private const long ScanLimit = 256L * 1024 * 1024;
@@ -285,7 +292,11 @@ internal static class ExportFileCheck
             if (d.StepAp != want) problems.Add($"FILE_SCHEMA is '{d.Schema}'{(d.StepAp is int got ? $" (AP{got})" : "")}, not AP{want}");
             else checks.Add($"FILE_SCHEMA {d.Schema} = AP{want}");
         }
-        if (new FileInfo(file).Length > ScanLimit) return;
+        if (new FileInfo(file).Length > ScanLimit)
+        {
+            if (e.SingleBody) problems.Add("the STEP is too large to verify its selected-body scope");
+            return;
+        }
         int solids = 0, shells = 0;
         foreach (var line in Lines(file))
         {
@@ -295,6 +306,14 @@ internal static class ExportFileCheck
         }
         d.Solids = solids;
         if (shells > 0) d.SurfaceModels = shells;
+        if (e.SingleBody)
+        {
+            if (solids != 1 || shells != 0)
+                problems.Add($"selected-body STEP must contain one B-rep solid and no surface models (found {solids} solids, {shells} surface models)");
+            else checks.Add("one B-rep solid and no surface models");
+            if (!Latin1(Tail(file, 2048)).TrimEnd().EndsWith("END-ISO-10303-21;", StringComparison.Ordinal))
+                problems.Add("the STEP has no END-ISO-10303-21 trailer");
+        }
     }
 
     /// <summary>The application protocol a STEP FILE_SCHEMA belongs to (null when unknown).</summary>
@@ -371,7 +390,9 @@ internal static class ExportFileCheck
                 problems.Add($"not an STL file: {length} bytes is not 84 + 50 x n (binary) and it does not start with 'solid' (ASCII)");
                 return;
             }
-            mesh = AsciiMesh(file, length <= ScanLimit);
+            mesh = e.SingleBody && length <= ScanLimit
+                ? CheckedAsciiMesh(file, problems)
+                : AsciiMesh(file, length <= ScanLimit);
             checks.Add($"ASCII STL: {mesh.Triangles} facets");
         }
         d.Header = binary ? "STL (binary)" : "STL (ASCII)";
@@ -380,11 +401,31 @@ internal static class ExportFileCheck
         if (mesh.Triangles == 0) problems.Add("the STL contains no triangles");
         if (e.StlBinary is bool want && want != binary)
             problems.Add($"the STL is {(binary ? "binary" : "ASCII")}, but {(want ? "binary" : "ASCII")} was requested");
-        if (!mesh.HasGeometry) return;
+        if (!mesh.HasGeometry)
+        {
+            if (e.SingleBody) problems.Add("the selected-body STL could not be scanned for dimensions and volume");
+            return;
+        }
 
         var size = mesh.Size;
-        var (unit, perMm) = InferUnits(size, e.ModelSizeMm);
         double volume = Math.Abs(mesh.Volume);
+        if (e.SingleBody)
+        {
+            // The selected-body path explicitly sets millimetres. Unit inference could conceal a wrong-scale file.
+            if (e.ModelSizeMm is not { Length: 3 } expected ||
+                !size.Zip(expected).All(p => double.IsFinite(p.First) && Math.Abs(p.First - p.Second) <= Math.Max(0.02, 0.01 * p.Second)))
+                problems.Add("the STL's three dimensions in mm do not match the selected body");
+            else checks.Add("all three STL dimensions match the selected body (mm)");
+            if (e.BodyVolumeMm3 is not double wantVolume || !double.IsFinite(volume) || volume <= 0 ||
+                Math.Abs(volume - wantVolume) > 0.05 * wantVolume)
+                problems.Add("the STL mesh volume in mm³ differs from the selected body by more than 5%");
+            else checks.Add("STL mesh volume matches the selected body within 5%");
+            d.Units = "mm";
+            d.SizeMm = size.Select(v => Math.Round(v, 4)).ToArray();
+            d.VolumeMm3 = Math.Round(volume, 3);
+            return;
+        }
+        var (unit, perMm) = InferUnits(size, e.ModelSizeMm);
         if (unit is not null)
         {
             d.Units = unit;
@@ -490,6 +531,48 @@ internal static class ExportFileCheck
         }
         if (!geometry || mesh.Triangles < facets) mesh.Triangles = facets;
         return mesh;
+    }
+
+    /// <summary>Reads complete facets and the end marker before accepting a selected body's mesh measurements.</summary>
+    private static Mesh CheckedAsciiMesh(string file, List<string> problems)
+    {
+        var mesh = new Mesh();
+        using var lines = Lines(file).Select(l => l.Trim()).Where(l => l.Length != 0).GetEnumerator();
+        var vertices = new double[9];
+        if (!ReadWord("solid")) return Incomplete();
+        while (lines.MoveNext())
+        {
+            if (StartsWord(lines.Current, "endsolid")) return lines.MoveNext() ? Incomplete() : mesh;
+            if (!StartsWord(lines.Current, "facet") || !StartsWord(lines.Current.AsSpan(5).TrimStart(), "normal") ||
+                !ReadWord("outer") || !lines.Current.AsSpan(5).Trim().Equals("loop", StringComparison.OrdinalIgnoreCase))
+                return Incomplete();
+            for (int vertex = 0; vertex < 3; vertex++)
+            {
+                if (!ReadWord("vertex")) return Incomplete();
+                var parts = lines.Current[6..].Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length != 3) return Incomplete();
+                for (int axis = 0; axis < 3; axis++)
+                {
+                    if (!double.TryParse(parts[axis], NumberStyles.Float, CultureInfo.InvariantCulture, out double value) ||
+                        !double.IsFinite(value)) return Incomplete();
+                    vertices[vertex * 3 + axis] = value;
+                }
+            }
+            if (!ReadLine("endloop") || !ReadLine("endfacet")) return Incomplete();
+            mesh.Add(vertices[0], vertices[1], vertices[2], vertices[3], vertices[4], vertices[5], vertices[6], vertices[7], vertices[8]);
+        }
+        return Incomplete();
+
+        bool ReadWord(string word) => lines.MoveNext() && StartsWord(lines.Current, word);
+        bool ReadLine(string line) => lines.MoveNext() && lines.Current.Equals(line, StringComparison.OrdinalIgnoreCase);
+        Mesh Incomplete()
+        {
+            problems.Add("the selected-body ASCII STL has an incomplete facet or missing endsolid marker");
+            return mesh;
+        }
+
+        static bool StartsWord(ReadOnlySpan<char> line, string word) => line.StartsWith(word, StringComparison.OrdinalIgnoreCase) &&
+            (line.Length == word.Length || char.IsWhiteSpace(line[word.Length]));
     }
 
     // ------------------------------------------------------------------ 3MF
@@ -769,13 +852,17 @@ public sealed class ExportService(SwSession session)
                 ctx.Documents.Find(d)?.ServerSketch == sketch ? "Finish it with sketch_finish first." : "The user is editing it; ask them to exit the sketch.");
         }
         ctx.CheckUserCommand();
-        double[]? modelMm = ModelSizeMm(ctx, d, kind, f);
-        string full = ctx.Paths.ForWrite(file, q.Overwrite, out string? backup);
+        var body = q.Body is null ? null : ExportBody(ctx, d, kind, f, q.Body);
+        double[]? modelMm = body is null ? ModelSizeMm(ctx, d, kind, f) : body.Shape?.SizeMm;
+        using var stage = body is null ? null : new SelectedBodyExportStage(ctx.Paths, file, q.Overwrite);
+        string? backup = null;
+        string full = stage?.Destination ?? ctx.Paths.ForWrite(file, q.Overwrite, out backup);
+        string translatorPath = stage?.TranslatorPath ?? full;
         WarnIgnoredOptions(ctx, q, f);
 
         var dir = System.IO.Path.GetDirectoryName(full)!;
-        var before = DirectoryNames(dir);
-        string? previous = ActualFile(full);
+        var before = stage is null ? DirectoryNames(dir) : null;
+        string? previous = stage is null ? ActualFile(full) : null;
         string? aside = previous is null ? null : MoveAside(previous);
         string? written = null;
         bool keep = false;
@@ -790,14 +877,28 @@ public sealed class ExportService(SwSession session)
             {
                 using var prefs = ctx.SystemPrefs();
                 if (f.Name == "step") SetStepAp(ctx, prefs, q.StepAp, settings);
-                else if (f.Name == "stl") SetStl(ctx, prefs, q, plan.Quality, settings);
-                ok = Save(ctx, d, full, f, kind, ref errors, ref warnings);
+                else if (f.Name == "stl")
+                {
+                    SetStl(ctx, prefs, q, plan.Quality, settings);
+                    if (body is not null)
+                    {
+                        prefs.Integer(SystemPrefIds.StlUnits, (int)swLengthUnit_e.swMM);
+                        if (ctx.App.GetUserPreferenceIntegerValue(SystemPrefIds.StlUnits) != (int)swLengthUnit_e.swMM)
+                            throw new SwException(ErrorCodes.VerifyFailed, "SOLIDWORKS did not accept millimetres for the selected-body STL.");
+                        settings.Add("STL units mm");
+                    }
+                }
+                // SW2024 accepted a body selection but wrote an empty STL. Export a verified
+                // one-body scratch part as a whole model for this translator.
+                ok = body is not null && f.Name == "stl"
+                    ? SaveIsolatedStl(ctx, translatorPath, f, body, ref errors, ref warnings)
+                    : Save(ctx, d, translatorPath, f, kind, body?.Reference, ref errors, ref warnings);
             }
             finally
             {
                 PrefAudit.Check(ctx, options); // after the scope restored its own changes
             }
-            written = ok ? WaitForFile(full) : ActualFile(full);
+            written = ok ? WaitForFile(translatorPath) : ActualFile(translatorPath);
             // Some SOLIDWORKS 2024 installs write the PDF completely but still
             // return swGenericSaveError. Do not discard a potentially valid PDF:
             // the freshness, size, PDF signature and EOF checks below still gate it.
@@ -806,7 +907,7 @@ public sealed class ExportService(SwSession session)
             if (!ok && !verifyGenericPdf)
                 throw new SwException(ErrorCodes.IoError, $"SOLIDWORKS could not export '{full}' ({DocumentService.SaveErrors(errors)}).", SaveHint(errors, f));
             if (written is null)
-                throw new SwException(ErrorCodes.VerifyFailed, $"SOLIDWORKS reported success but did not write '{System.IO.Path.GetFileName(full)}'.{Strays(dir, before, start)}",
+                throw new SwException(ErrorCodes.VerifyFailed, $"SOLIDWORKS reported success but did not write '{System.IO.Path.GetFileName(full)}'.{(before is null ? "" : Strays(dir, before, start))}",
                     "Check dialog_list for a message; for assemblies, components may have been written as separate files.");
 
             var fi = new FileInfo(written);
@@ -816,10 +917,12 @@ public sealed class ExportService(SwSession session)
             var details = problems.Count > 0
                 ? new ExportDetails()
                 : ExportFileCheck.Inspect(f.Name, written, new ExportFileCheck.Expect(
-                    f.Name == "step" ? q.StepAp : null, f.Name == "stl" ? q.StlBinary : null, modelMm), problems);
+                    f.Name == "step" ? q.StepAp : null, f.Name == "stl" ? q.StlBinary : null, modelMm,
+                    SingleBody: body is not null, BodyVolumeMm3: body?.Shape?.VolumeMm3), problems);
             if (problems.Count > 0)
             {
-                string removed = $"It was removed{(aside is null ? "" : " and the previous file put back")}.";
+                string removed = stage is not null ? "The staged file was discarded."
+                    : $"It was removed{(aside is null ? "" : " and the previous file put back")}.";
                 // Live: with option 75 reading 242, SOLIDWORKS 2025 Premium still wrote AP203 (AP242 output can depend on
                 // the license, e.g. SOLIDWORKS MBD). That is a capability limit, not a broken file.
                 if (f.Name == "step" && q.StepAp == 242 && details.StepAp is int got && got != 242)
@@ -828,14 +931,18 @@ public sealed class ExportService(SwSession session)
                         $"such as SOLIDWORKS MBD). {removed}",
                         "Use stepAp 214 (AUTOMOTIVE_DESIGN, read by most CAD/CAM software) or 203.");
                 throw new SwException(ErrorCodes.VerifyFailed,
-                    $"The exported '{System.IO.Path.GetFileName(written)}' failed verification: {string.Join("; ", problems)}. {removed}",
+                    $"The exported '{System.IO.Path.GetFileName(stage is null ? written : full)}' failed verification: {string.Join("; ", problems)}. {removed}",
                     f.Name == "stl" ? "Retry with other stl* options, or check the model (model_info)." : "Check the model (model_info), or try another format.");
             }
             if (verifyGenericPdf)
                 ctx.Warn("SOLIDWORKS returned swGenericSaveError although it wrote a fresh PDF with a valid signature and EOF. " +
                          "The PDF passed file verification; review its rendered content before using it.");
             if (warnings != 0) ctx.Warn($"Export warnings: {DocumentService.SaveWarnings(warnings)}.");
-            details.Checks = [$"new file written by this call ({fi.Length} bytes)", .. details.Checks ?? []];
+            long size = fi.Length;
+            bool replaced = previous is not null;
+            if (stage is not null)
+                (written, replaced, backup) = stage.Publish(written);
+            details.Checks = [$"new file written by this call ({size} bytes)", .. details.Checks ?? []];
             ctx.Paths.RecordWritten(written);
             keep = true;
             return new ExportResult
@@ -843,26 +950,194 @@ public sealed class ExportService(SwSession session)
                 Doc = ctx.Title(d),
                 Path = written,
                 Format = f.Name,
-                SizeBytes = fi.Length,
+                SizeBytes = size,
                 Settings = settings.Count == 0 ? null : settings,
                 Details = details,
-                Replaced = previous is not null ? true : null,
+                Resolved = body is null ? null : [body.Reference.Info("body")],
+                Replaced = replaced ? true : null,
                 BackupPath = backup,
             };
         }
         finally
         {
-            if (keep)
+            // The stage's own cleanup never looks up or deletes the final destination.
+            if (stage is null)
             {
-                if (aside is not null) TryDelete(aside);
+                if (keep)
+                {
+                    if (aside is not null) TryDelete(aside);
+                }
+                else
+                {
+                    // Roll back: nothing this call wrote stays, and the file it replaced comes back.
+                    var mine = written ?? ActualFile(full);
+                    if (mine is not null) TryDelete(mine);
+                    if (aside is not null && previous is not null && !TryMove(aside, previous))
+                        ctx.Warn($"The previous file could not be put back; it is at '{aside}'.");
+                }
             }
-            else
+        }
+    }
+
+    /// <summary>A same-directory staging file for a selected-body export. Publish only after file verification.</summary>
+    internal sealed class SelectedBodyExportStage : IDisposable
+    {
+        private readonly PathPolicy _paths;
+        private readonly bool _overwrite;
+        private bool _published;
+
+        public SelectedBodyExportStage(PathPolicy paths, string path, bool overwrite)
+        {
+            _paths = paths;
+            _overwrite = overwrite;
+            Destination = paths.CheckWritePath(path, overwrite);
+            TranslatorPath = Path.Combine(Path.GetDirectoryName(Destination)!,
+                $"swmcp-export-{Guid.NewGuid():N}{Path.GetExtension(Destination)}");
+        }
+
+        public string Destination { get; }
+        public string TranslatorPath { get; }
+
+        public (string Path, bool Replaced, string? BackupPath) Publish(string verifiedFile)
+        {
+            if (_published || !string.Equals(verifiedFile, TranslatorPath, StringComparison.OrdinalIgnoreCase))
+                throw new SwException(ErrorCodes.VerifyFailed, "The selected-body export did not return its own staging file.");
+
+            // Use the existing file's exact name on replacement. A new file follows the translator's extension case.
+            string? existing = ActualFile(Destination);
+            string target = existing ?? Path.ChangeExtension(Destination, Path.GetExtension(verifiedFile));
+            bool replace = _overwrite && existing is not null;
+            try
             {
-                // Roll back: nothing this call wrote stays, and the file it replaced comes back.
-                var mine = written ?? ActualFile(full);
-                if (mine is not null) TryDelete(mine);
-                if (aside is not null && previous is not null && !TryMove(aside, previous))
-                    ctx.Warn($"The previous file could not be put back; it is at '{aside}'.");
+                target = _paths.ForWrite(target, replace, out string? backup);
+                if (replace)
+                    File.Replace(verifiedFile, target, null);
+                else
+                    File.Move(verifiedFile, target, overwrite: false);
+                _published = true;
+                return (target, replace, backup);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new SwException(ErrorCodes.IoError, $"Could not publish the verified export to '{target}': {ex.Message}",
+                    "The destination may have changed or be locked. Choose another name or retry.", ex);
+            }
+        }
+
+        public void Dispose()
+        {
+            if (!_published && ActualFile(TranslatorPath) is string candidate) TryDelete(candidate);
+        }
+    }
+
+    private sealed record SelectedExportBody(Resolved Reference, ExportBodyShape? Shape = null);
+
+    private sealed record ExportBodyShape(double[] BoundsMm, double VolumeMm3)
+    {
+        public double[] SizeMm => [BoundsMm[3] - BoundsMm[0], BoundsMm[4] - BoundsMm[1], BoundsMm[5] - BoundsMm[2]];
+    }
+
+    private static SelectedExportBody ExportBody(SwContext ctx, IModelDoc2 d, ExportDocs kind, ExportFormat format, EntityRef body)
+    {
+        if (kind != ExportDocs.Part)
+            throw new SwException(ErrorCodes.WrongDocType, "'body' export needs a part document.");
+        var reference = BodyKit.ResolveBody(ctx, d, body, "body", BodyKind.Solid);
+        var solid = (IBody2)reference.Obj;
+        if (!((IPartDoc)d).Bodies(swBodyType_e.swSolidBody, visibleOnly: true).Any(b => SameExportBody(d, b, solid)))
+            throw SwException.InvalidArgument($"{reference.Label} is not a visible solid in this part.");
+        return new SelectedExportBody(reference, format.Name == "stl" ? MeasureExportBody(solid, reference.Label) : null);
+    }
+
+    private static ExportBodyShape MeasureExportBody(IBody2 solid, string label)
+    {
+        if (!solid.GetExtremePoint(-1, 0, 0, out double minX, out _, out _) ||
+            !solid.GetExtremePoint(0, -1, 0, out _, out double minY, out _) ||
+            !solid.GetExtremePoint(0, 0, -1, out _, out _, out double minZ) ||
+            !solid.GetExtremePoint(1, 0, 0, out double maxX, out _, out _) ||
+            !solid.GetExtremePoint(0, 1, 0, out _, out double maxY, out _) ||
+            !solid.GetExtremePoint(0, 0, 1, out _, out _, out double maxZ))
+            throw new SwException(ErrorCodes.VerifyFailed, $"Could not measure the exact bounds of {label}.");
+        double[] bounds = [Units.Mm(minX), Units.Mm(minY), Units.Mm(minZ), Units.Mm(maxX), Units.Mm(maxY), Units.Mm(maxZ)];
+        var mass = solid.MassOfBody();
+        double volume = mass.Length > 3 ? Units.Mm3(mass[3]) : 0;
+        var shape = new ExportBodyShape(bounds, volume);
+        if (!double.IsFinite(volume) || volume <= 0 || shape.SizeMm.Any(s => !double.IsFinite(s) || s <= 0))
+            throw new SwException(ErrorCodes.VerifyFailed, $"Could not measure positive dimensions and volume of {label}.");
+        return shape;
+    }
+
+    private static bool SameExportBody(IModelDoc2 doc, IBody2 a, IBody2 b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        var ext = doc.Extension;
+        var pa = ComArgs.Bytes((object?)ext.GetPersistReference3(a));
+        var pb = ComArgs.Bytes((object?)ext.GetPersistReference3(b));
+        return pa is not null && pb is not null && ext.IsSamePersistentID(pa, pb) == (int)swObjectEquality.swObjectSame;
+    }
+
+    /// <summary>Copies the requested solid into an unsaved part, so STL sees a whole model with one body.</summary>
+    private static bool SaveIsolatedStl(SwContext ctx, string full, ExportFormat format, SelectedExportBody requested,
+        ref int errors, ref int warnings)
+    {
+        string template = ctx.App.GetUserPreferenceStringValue((int)swUserPreferenceStringValue_e.swDefaultTemplatePart);
+        if (string.IsNullOrWhiteSpace(template) || !File.Exists(template) ||
+            !string.Equals(Path.GetExtension(template), ".prtdot", StringComparison.OrdinalIgnoreCase))
+            throw new SwException(ErrorCodes.IoError, "Selected-body STL needs a valid default part template.",
+                "Set a .prtdot under SOLIDWORKS Tools > Options > Default Templates.");
+        if ((object?)((IBody2)requested.Reference.Obj).Copy() is not IBody2 copy || !copy.IsTemporaryBody())
+            throw new SwException(ErrorCodes.FeatureFailed, $"Could not copy {requested.Reference.Label} into a temporary body.");
+        var previous = ctx.ActiveDocOrNull;
+        var openBefore = ctx.App.Documents();
+        var scratch = (object?)ctx.App.NewDocument(template, 0, 0, 0) as IModelDoc2
+                      ?? throw new SwException(ErrorCodes.FeatureFailed, "Could not create a temporary part for selected-body STL.");
+        if (openBefore.Any(d => ReferenceEquals(d, scratch)))
+            throw new SwException(ErrorCodes.VerifyFailed, "NewDocument returned an existing document during selected-body STL export.");
+
+        try
+        {
+            ctx.Documents.SetClass(scratch, DocClass.Owned, "temporary selected-body STL");
+            scratch.SetTitle2($"MCP_STL_{Guid.NewGuid():N}");
+            if (scratch is not IPartDoc part || part.AllBodies(visibleOnly: false).Count != 0)
+                throw new SwException(ErrorCodes.VerifyFailed, "The default part template did not create an empty part.");
+            if ((object?)part.CreateFeatureFromBody3(copy, false, (int)swCreateFeatureBodyOpts_e.swCreateFeatureBodyCheck) is not IFeature)
+                throw new SwException(ErrorCodes.FeatureFailed, $"Could not insert a checked copy of {requested.Reference.Label} into the temporary part.");
+            var bodies = part.AllBodies(visibleOnly: false);
+            if (bodies.Count != 1 || bodies[0].GetType() != (int)swBodyType_e.swSolidBody ||
+                part.Bodies(swBodyType_e.swSolidBody, visibleOnly: true).Count != 1 || bodies[0].FaultList().Count != 0)
+                throw new SwException(ErrorCodes.VerifyFailed, "The temporary part does not contain exactly one valid visible solid.");
+            var actual = MeasureExportBody(bodies[0], "the temporary solid");
+            var expected = requested.Shape!;
+            if (actual.BoundsMm.Zip(expected.BoundsMm).Any(p => Math.Abs(p.First - p.Second) > 0.0001) ||
+                Math.Abs(actual.VolumeMm3 - expected.VolumeMm3) > Math.Max(0.002, expected.VolumeMm3 * 0.0001))
+                throw new SwException(ErrorCodes.VerifyFailed, "The temporary solid does not match the requested body's bounds and volume.");
+            return Save(ctx, scratch, full, format, ExportDocs.Part, null, ref errors, ref warnings);
+        }
+        finally
+        {
+            try
+            {
+                // CloseDoc is title-based. Close only the object created by this call.
+                string title = ctx.Title(scratch);
+                if (string.IsNullOrWhiteSpace(title))
+                    throw new SwException(ErrorCodes.VerifyFailed, "The temporary export part has no safe title for cleanup.");
+                var matching = ctx.App.Documents().Where(d => string.Equals(ctx.Title(d), title, StringComparison.OrdinalIgnoreCase)).ToList();
+                if (matching.Count != 1 || !ReferenceEquals(matching[0], scratch))
+                    throw new SwException(ErrorCodes.VerifyFailed, $"Could not uniquely identify temporary part '{title}' for cleanup.");
+                ctx.App.CloseDoc(title);
+                if (ctx.App.Documents().Any(d => ReferenceEquals(d, scratch)))
+                    throw new SwException(ErrorCodes.VerifyFailed, $"Temporary part '{title}' could not be closed.");
+                ctx.Documents.Remove(scratch);
+                ctx.Entities.Forget(scratch);
+            }
+            finally
+            {
+                if (previous is not null && (ctx.ActiveDocOrNull is not IModelDoc2 active || !DocLocator.SameDoc(active, previous)))
+                {
+                    int restoreError = 0;
+                    ctx.App.ActivateDoc3(ctx.Title(previous), false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, ref restoreError);
+                    if (ctx.ActiveDocOrNull is not IModelDoc2 restored || !DocLocator.SameDoc(restored, previous))
+                        ctx.Warn($"The previous active document could not be restored after STL export (error {restoreError}).");
+                }
             }
         }
     }
@@ -970,24 +1245,50 @@ public sealed class ExportService(SwSession session)
     /// SaveAs3 with the document active (images and PDFs render its window; the user's active document and selection are
     /// restored afterwards).
     /// </summary>
-    private static bool Save(SwContext ctx, IModelDoc2 d, string full, ExportFormat f, ExportDocs kind, ref int errors, ref int warnings)
+    private static bool Save(SwContext ctx, IModelDoc2 d, string full, ExportFormat f, ExportDocs kind, Resolved? body,
+        ref int errors, ref int warnings)
     {
         bool image = f.Name is "png" or "jpg";
+        bool neutral = f.Docs == ExportDocs.Model;
         var previous = ctx.ActiveDocOrNull;
         bool switched = false;
-        if (previous is null || !DocLocator.SameDoc(previous, d))
-        {
-            int e = 0;
-            ctx.App.ActivateDoc3(ctx.Title(d), false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, ref e);
-            switched = true;
-            var now = ctx.ActiveDocOrNull;
-            if (now is null || !DocLocator.SameDoc(now, d)) ctx.Warn($"'{ctx.Title(d)}' could not be activated for the export (error {e}).");
-        }
         ISelectionMgr? sel = null;
         bool suspended = false;
         try
         {
-            if (image)
+            if (previous is null || !DocLocator.SameDoc(previous, d))
+            {
+                int e = 0;
+                switched = true;
+                ctx.App.ActivateDoc3(ctx.Title(d), false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, ref e);
+                var now = ctx.ActiveDocOrNull;
+                if (now is null || !DocLocator.SameDoc(now, d))
+                {
+                    string message = $"'{ctx.Title(d)}' could not be activated for the export (error {e}).";
+                    if (neutral) throw new SwException(ErrorCodes.VerifyFailed, message);
+                    ctx.Warn(message);
+                }
+            }
+            if (neutral)
+            {
+                // SaveAs3 otherwise uses ambient face/body selections, even on the whole-model path.
+                sel = d.Sel();
+                if (body is not null || sel.GetSelectedObjectCount2(-1) != 0)
+                {
+                    sel.SuspendSelectionList(); // Return value describes the old list, including 0 for an empty list.
+                    suspended = true;
+                }
+                if (sel.GetSelectedObjectCount2(-1) != 0)
+                    throw new SwException(ErrorCodes.VerifyFailed, "Could not isolate the selection for the export.");
+                if (body is not null)
+                {
+                    BodyKit.SelectAll(d, [body], 0);
+                    if (sel.GetSelectedObjectCount2(-1) != 1 || sel.GetSelectedObjectCount2(0) != 1 ||
+                        sel.BdSelected(1) is not IBody2 selected || !SameExportBody(d, selected, (IBody2)body.Obj))
+                        throw new SwException(ErrorCodes.VerifyFailed, "The export selection did not contain exactly the requested solid body.");
+                }
+            }
+            else if (image)
             {
                 try
                 {
@@ -1012,8 +1313,15 @@ public sealed class ExportService(SwSession session)
         {
             try
             {
-                if (suspended) sel!.ResumeSelectionList();
+                if (suspended) sel!.ResumeSelectionList2(false);
                 if (image) d.GraphicsRedraw2();
+            }
+            catch (COMException ex)
+            {
+                ctx.Warn($"The previous selection could not be fully restored after the export: {ex.Message}");
+            }
+            try
+            {
                 if (switched && previous is not null)
                 {
                     int e = 0;
@@ -1022,7 +1330,7 @@ public sealed class ExportService(SwSession session)
             }
             catch (COMException ex)
             {
-                ctx.Warn($"The previous view state could not be fully restored after the export: {ex.Message}");
+                ctx.Warn($"The previous active document could not be fully restored after the export: {ex.Message}");
             }
         }
     }

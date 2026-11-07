@@ -55,7 +55,14 @@ public sealed class PathPolicy
     /// <paramref name="overwrite"/>, and — when overwriting a file not written by this server in this session — moves
     /// the old file to the backup folder first (returned in <paramref name="backupPath"/>).
     /// </summary>
-    public string ForWrite(string path, bool overwrite, out string? backupPath, string argName = "path")
+    public string ForWrite(string path, bool overwrite, out string? backupPath, string argName = "path") =>
+        ForWrite(path, overwrite, backupExisting: true, out backupPath, argName);
+
+    /// <summary>Checks the destination for a staged write. The caller requests the backup at publish time.</summary>
+    internal string CheckWritePath(string path, bool overwrite) =>
+        ForWrite(path, overwrite, backupExisting: false, out _, "path");
+
+    private string ForWrite(string path, bool overwrite, bool backupExisting, out string? backupPath, string argName)
     {
         backupPath = null;
         string full = Normalize(path, argName);
@@ -67,14 +74,17 @@ public sealed class PathPolicy
             if (!overwrite)
                 throw new SwException(ErrorCodes.IoError, $"'{full}' already exists.",
                     "Pass overwrite=true to replace it (the old file is backed up unless this server wrote it), or choose another name.");
-            bool ours;
-            lock (_gate) ours = _writtenThisSession.Contains(full);
-            if (!ours)
+            if (backupExisting)
             {
-                string dir = Path.Combine(BackupDir, DateTime.Now.ToString("yyyyMMdd-HHmmss"));
-                Directory.CreateDirectory(dir);
-                backupPath = Path.Combine(dir, Path.GetFileName(full));
-                File.Copy(full, backupPath, overwrite: true);
+                bool ours;
+                lock (_gate) ours = _writtenThisSession.Contains(full);
+                if (!ours)
+                {
+                    string dir = Path.Combine(BackupDir, DateTime.Now.ToString("yyyyMMdd-HHmmss"));
+                    Directory.CreateDirectory(dir);
+                    backupPath = Path.Combine(dir, Path.GetFileName(full));
+                    File.Copy(full, backupPath, overwrite: true);
+                }
             }
         }
         Directory.CreateDirectory(Path.GetDirectoryName(full)!);

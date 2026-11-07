@@ -147,6 +147,78 @@ public class ExportLiveTests(LiveFixture fx) : LiveTest(fx)
 
     // ------------------------------------------------------------------ STL
 
+    private async Task<string> TwoBodiesAsync(SwSession session)
+    {
+        string doc = await NewPartAsync("export_bodies", session);
+        var sketch = new SketchService(session);
+        await sketch.StartAsync(doc, new EntityRef { Name = "top" }, false);
+        await sketch.AddAsync(doc,
+        [
+            new SketchEntity { Kind = "rectangle", Center = [-80, 0], WidthMm = 20, HeightMm = 30 },
+            new SketchEntity { Kind = "rectangle", Center = [80, 0], WidthMm = 90, HeightMm = 40 },
+        ]);
+        await new FeatureService(session).ExtrudeAsync(new ExtrudeRequest { Doc = doc, DepthMm = 10, Merge = false });
+        return doc;
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task Selected_stl_exports_one_body_of_a_multibody_part(bool binary)
+    {
+        string doc = await TwoBodiesAsync(S);
+        var source = await new MeasureService(S).BodyListAsync(doc);
+        Assert.Equal(2, source.Solids);
+        var small = Assert.Single(source.Bodies, b => Math.Abs((b.VolumeMm3 ?? 0) - 6000) < V);
+        var exporter = new ExportService(S);
+        var selection = new EntityRef { Id = small.Id };
+        string? selectedFace = await TestHooks.SelectedFaceAsync(S, doc, [80, 10, 0]);
+        Assert.NotNull(selectedFace);
+        var openBefore = (await TestHooks.OpenTitlesAsync(S)).Order().ToArray();
+        var stl = await exporter.ExportAsync(new ExportRequest { Doc = doc, Path = Path.Combine(_dir, "small.stl"), Body = selection, StlBinary = binary });
+        FreshFile(stl);
+        Assert.Equal(binary, stl.Details.Binary);
+        Assert.Equal("mm", stl.Details.Units);
+        Assert.Equal([20, 10, 30], stl.Details.SizeMm!);
+        Assert.Equal(6000, stl.Details.VolumeMm3!.Value, 0.5);
+        Assert.Equal(openBefore, (await TestHooks.OpenTitlesAsync(S)).Order().ToArray());
+        Assert.Equal(selectedFace, await TestHooks.SelectedFaceAsync(S, doc));
+        Assert.Equal(2, (await new MeasureService(S).BodyListAsync(doc)).Solids);
+    }
+
+    [Fact]
+    public async Task Selected_step_exports_one_body_of_a_multibody_part()
+    {
+        string doc = await TwoBodiesAsync(S);
+        var source = await new MeasureService(S).BodyListAsync(doc);
+        Assert.Equal(2, source.Solids);
+        var small = Assert.Single(source.Bodies, b => Math.Abs((b.VolumeMm3 ?? 0) - 6000) < V);
+        var step = await new ExportService(S).ExportAsync(new ExportRequest
+        {
+            Doc = doc, Path = Path.Combine(_dir, "small.step"), Body = new EntityRef { Id = small.Id },
+        });
+        FreshFile(step);
+        Assert.Equal(1, step.Details.Solids);
+        var imported = await Open(step.Path, readOnly: true);
+        var roundTrip = await new MeasureService(S).BodyListAsync(imported.Document.Handle);
+        Assert.Equal(6000, Assert.Single(roundTrip.Bodies).VolumeMm3!.Value, V);
+        Assert.Equal(2, (await new MeasureService(S).BodyListAsync(doc)).Solids);
+    }
+
+    [Fact]
+    public async Task Whole_step_ignores_an_ambient_face_selection_and_restores_it()
+    {
+        string doc = await TwoBodiesAsync(S);
+        string? selected = await TestHooks.SelectedFaceAsync(S, doc, [-80, 10, 0]);
+        Assert.NotNull(selected);
+        var exported = await new ExportService(S).ExportAsync(new ExportRequest
+        {
+            Doc = doc, Path = Path.Combine(_dir, "whole.step"),
+        });
+        Assert.Equal(2, exported.Details.Solids);
+        Assert.Equal(selected, await TestHooks.SelectedFaceAsync(S, doc));
+    }
+
     [Fact]
     public async Task Stl_binary_size_is_84_plus_50_per_triangle_and_the_real_name_is_reported()
     {
@@ -794,7 +866,7 @@ public class HelpGuideTests
     {
         Assert.Equal(Toolsets.Catalog.Keys.OrderBy(x => x, StringComparer.Ordinal), Guide.Tools().Select(t => t.Name).OrderBy(x => x, StringComparer.Ordinal));
         string text = Guide.Get("tools").Text;
-        Assert.Contains("model_export {path, format?, stepAp?, stlBinary?, stlQuality?, stlDeviationMm?, stlAngleDeg?, overwrite?, doc?}", text);
+        Assert.Contains("model_export {path, format?, stepAp?, stlBinary?, stlQuality?, stlDeviationMm?, stlAngleDeg?, overwrite?, body?, doc?}", text);
         Assert.Contains("doc_open {path, readOnly?, configuration?}", text);
         Assert.Contains("sw_help {topic?}: Help and guides (read-only)", text);
     }

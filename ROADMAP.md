@@ -291,7 +291,7 @@ is left is the rest of the sketch toolbox.
 | T4.1 | Arc and center-point slots | `CreateSketchSlot` with the arc and center types | Slot width and arc radius measured | 6 | P1 | 🟡 |
 | T4.2 | Conics, parabolas, elliptical arcs, tangent arcs | `CreateConic`, `CreateParabola`, `CreateEllipticalArc`, `CreateTangentArc` | Points on the curve satisfy its equation; tangency read back | 8 | P2 | ⬜ |
 | T4.3 | Equation-driven curves | `CreateEquationSpline2` (explicit and parametric) for cams, involutes, airfoils | Sampled points match the equation within 1 µm | 6 | P1 | ⬜ |
-| T4.4 | Spline control | Tangency and curvature at points, handles, fit splines, editing spline points | Tangent directions read back at each point | 10 | P2 | ⬜ |
+| T4.4 | Spline control | `sketch_spline_edit` moves fit points. Tangency, curvature and control handles remain open. | Tangent directions read back at each point | 10 | P2 | 🟡 |
 | T4.5 | 3D sketch geometry | Lines, arcs and splines in 3D sketches, 3D sketch planes, relations along X/Y/Z | A 3D polyline's segments read back at their points | 12 | P1 | 🟡 |
 | T4.6 | Sketch blocks | `MakeSketchBlockFromSelected`, `InsertSketchBlockInstance`, explode, edit | Block instances move as one; exploded entities read back | 12 | P2 | ⬜ |
 | T4.7 | Sketch pictures | `InsertSketchPicture2` at a scale and position, for tracing | The picture's size in mm read back | 6 | P2 | ⬜ |
@@ -314,7 +314,7 @@ rarer feature types.
 |---|---|---|---|---|---|---|
 | T5.1 | Extrude end conditions | Up to vertex, up to surface, offset from surface, up to body, up to next; start offset or start from a surface; two directions with their own depths | The end face is coincident with (or at the offset from) its target, measured | 12 | P0 | 🟡 |
 | T5.2 | Contour selection | Extrude or cut chosen regions of a sketch with several loops (sketch regions and contours) | Volume = the selected regions' area × depth | 8 | P0 | ⬜ |
-| T5.3 | Thin features | `FeatureExtrusionThin2`, `FeatureRevolveThin`, thin sweeps and lofts; one-sided, two-sided, mid | Wall thickness by ray cast equals t | 10 | P1 | ⬜ |
+| T5.3 | Thin features | `feature_extrude` supports centered thin bosses with a blind depth. Thin cuts, revolutions, sweeps and lofts remain open. | Wall thickness by ray cast equals t | 10 | P1 | 🟡 |
 | T5.4 | Edit feature definitions | A `feature_edit` tool: change an existing extrude's end condition, a fillet's edges or radius, a pattern's count and seed, a hole's type and size, through `IFeatureData` + `ModifyDefinition` | Each edit rebuilds without errors and the geometry shows the change; a failed edit is undone | 24 | P0 | ⬜ |
 | T5.5 | Reorder features | `IModelDocExtension.ReorderFeature` with the dependency check | The tree order reads back; the volume is unchanged where the order doesn't matter | 6 | P1 | ⬜ |
 | T5.6 | Table-driven patterns | `InsertTableDrivenPattern2` with X/Y points from a coordinate system | Instances at the table's points | 8 | P1 | ⬜ |
@@ -322,7 +322,7 @@ rarer feature types.
 | T5.8 | Variable (dimension-driven) patterns | `swFmDimPattern` with per-instance dimension values | Each instance's size measured | 12 | P2 | ⬜ |
 | T5.9 | Chain patterns | `swFmLocalChainPattern` along a closed path | Instances evenly along the chain, link to link | 12 | P2 | ⬜ |
 | T5.10 | Pattern options | Skip instances, vary sketch, pattern bodies instead of features, instances to vary | Skipped instances absent; body patterns add whole bodies | 8 | P1 | ⬜ |
-| T5.11 | Mirror bodies and faces | `InsertMirrorFeature2` with bodies | The mirrored body's volume and box reflected | 4 | P1 | ⬜ |
+| T5.11 | Mirror bodies and faces | `body_mirror` copies selected solids across a plane or planar face. Face mirroring remains open. | The mirrored body's volume and box reflected | 4 | P1 | 🟡 |
 | T5.12 | Advanced holes | `AdvancedHole2`: near- and far-side counterbores and countersinks, stacked elements | Each element's diameter and depth measured | 16 | P2 | ⬜ |
 | T5.13 | More Hole Wizard types and ends | Slot holes, pipe taps, legacy holes, up-to-surface and up-to-next ends, holes on curved faces, positions by a sketch with dimensions | Slot length and width measured; hole ends coincident with the target | 16 | P2 | ⬜ |
 | T5.14 | More thread standards | Inch UNC/UNF, pipe NPT/BSP, trapezoidal, left-hand, in `feature_thread` and Hole Wizard | Pitch and major diameter measured against the standard | 12 | P1 | ⬜ |
@@ -349,14 +349,14 @@ rarer feature types.
 | T5.35 | Center of mass and mate references | Center-of-mass point; mate references for smart insertion (with T9.3) | The point at the computed center; mates found from the references | 8 | P2 | ⬜ |
 
 ## T6 · Surfaces and freeform
-Extrude, revolve, planar, offset, fill, knit, thicken, trim, extend and untrim work. Open: the swept and lofted
-surfaces, mid-surfaces, flattening, quality analysis and repair of imported geometry.
+Extrude, revolve, planar, offset, fill, knit, thicken, trim, extend and untrim work. Surface sweep supports a 2D
+profile and an open path. Surface loft supports ordered sketch profiles and guides.
 
 | ID | Item | Approach (API) | Done when | h | P | State |
 |---|---|---|---|---|---|---|
-| T6.1 | Swept surfaces | `InsertSweepSurface3` | Area = profile length × path length for a straight sweep | 6 | P1 | ⬜ |
-| T6.2 | Lofted surfaces | `InsertLoftRefSurface2` with guides | Its edges pass through every profile | 6 | P1 | ⬜ |
-| T6.3 | Boundary surfaces | No API inserts one; probe `CreateDefinition` and `IBoundaryBossFeatureData` for surfaces | A surface through its curves in both directions | 8 | P2 | 🔬 |
+| T6.1 | Swept surfaces | `surface_sweep` uses `CreateDefinition(swFmRefSurface)`. Guides and closed paths remain open. | Area = profile length × path length for a straight normal sweep | 6 | P1 | 🟡 |
+| T6.2 | Lofted surfaces | `surface_loft` uses `InsertLoftRefSurface2` with guides | Its faces pass through every profile | 6 | P1 | ✅ |
+| T6.3 | Boundary surfaces | Probe the native boundary surface API and its directional selection groups | A surface through its curves in both directions | 8 | P2 | 🔬 |
 | T6.4 | Ruled surfaces | `InsertRuledSurfaceFromEdge2` (tangent, normal, tapered, sweep) | Width and angle measured from the edge | 6 | P2 | ⬜ |
 | T6.5 | Mid-surfaces | `InsertMidSurface` from face pairs (for shell meshes) | The mid faces at half the thickness | 6 | P1 | ⬜ |
 | T6.6 | Flatten surfaces | `InsertFlattenSurface2` (developed blanks of curved panels) | A cylinder segment flattens to its developed area | 8 | P2 | ⬜ |

@@ -243,12 +243,14 @@ public class BodySheetMetalLiveTests(LiveFixture fx) : LiveTest(fx)
     {
         // VERIFIED recipe (main mark 1, tools mark 2).
         string doc = await CubesAsync("subtract", smallX: 20);
+        var listed = await new MeasureService(S).BodyListAsync(doc);
+        string? toolName = Assert.Single(listed.Bodies, b => Math.Abs((b.VolumeMm3 ?? 0) - SmallMm3) < V).Name;
         var r = await Bs.CombineAsync(doc, At(-20, 20, 0), [At(30, 10, 0)], "subtract", false);
         Assert.Equal(CubeMm3 - OverlapMm3, r.Model.VolumeMm3, V); // 60 000
         Assert.Equal(1, r.Model.Bodies);
         Assert.Contains(r.Verified.Checks!, c => c.Contains("removed 4000 mm³"));
         Assert.Equal("main on mark 1, tools on mark 2", r.Method);
-        Assert.Equal("Boss-Extrude2", Assert.Single(r.RemovedBodies!));
+        Assert.Equal(toolName, Assert.Single(r.RemovedBodies!));
     }
 
     [Fact]

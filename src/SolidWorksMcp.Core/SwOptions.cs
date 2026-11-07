@@ -17,6 +17,9 @@ public sealed record SwOptions
     /// <summary>Launch SOLIDWORKS on the first call if it isn't running (SWMCP_AUTO_LAUNCH=1). Off by default.</summary>
     public bool AutoLaunch { get; init; }
 
+    /// <summary>Attach only to this running SOLIDWORKS process (SWMCP_SOLIDWORKS_PID), without auto-launch.</summary>
+    public int? TargetProcessId { get; init; }
+
     /// <summary>Enable vba_run / macro_run (SWMCP_VBA=on). Off by default: VBA is unrestricted code execution.</summary>
     public bool EnableVba { get; init; }
 
@@ -33,6 +36,12 @@ public sealed record SwOptions
         if (Seconds("SWMCP_TIMEOUT_S") is { } t) o = o with { DefaultTimeout = t };
         if (Seconds("SWMCP_QUEUE_WAIT_S") is { } q) o = o with { MaxQueueWait = q };
         if (IsOn("SWMCP_AUTO_LAUNCH")) o = o with { AutoLaunch = true };
+        if (Environment.GetEnvironmentVariable("SWMCP_SOLIDWORKS_PID") is { } pid)
+        {
+            if (!int.TryParse(pid, NumberStyles.None, CultureInfo.InvariantCulture, out int target) || target <= 0)
+                throw SwException.InvalidArgument("SWMCP_SOLIDWORKS_PID must be a positive process ID.");
+            o = o with { TargetProcessId = target };
+        }
         if (IsOn("SWMCP_VBA")) o = o with { EnableVba = true };
         if (Environment.GetEnvironmentVariable("SWMCP_MACRO_DIRS") is { Length: > 0 } dirs)
             o = o with { MacroDirs = dirs.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries) };

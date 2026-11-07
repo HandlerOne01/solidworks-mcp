@@ -2,6 +2,7 @@ using System.ComponentModel;
 using ModelContextProtocol;
 using ModelContextProtocol.Server;
 using SolidWorksMcp.Core;
+using SolidWorksMcp.Core.Model;
 using SolidWorksMcp.Core.Services;
 using SolidWorksMcp.Server.Hosting;
 
@@ -18,7 +19,7 @@ public sealed class ExportTools(SwSession session)
                  "format. Relative paths go under Documents\\solidworks-mcp; an existing file needs overwrite=true (backed up first unless this " +
                  "server wrote it). The export options are set only for this call and restored. Verified from the file itself: written by this " +
                  "call, not empty, header and details (STEP schema = AP, STL triangle count and size formula, image size). Returns the path " +
-                 "actually written (e.g. .STL in capitals).")]
+                 "actually written (e.g. .STL in capitals). Pass body to export one visible solid from a part as STEP or STL.")]
     public Task<string> ModelExport(
         IProgress<ProgressNotificationValue> progress,
         [Description("Output file, e.g. bracket.step, part.stl, view.png (the extension is added from 'format' when missing).")] string path,
@@ -29,12 +30,13 @@ public sealed class ExportTools(SwSession session)
         [Description("STL custom: maximum chordal deviation in mm.")] double? stlDeviationMm = null,
         [Description("STL custom: angle tolerance in degrees (0-90).")] double? stlAngleDeg = null,
         [Description("Replace an existing file.")] bool overwrite = false,
+        [Description("One visible part solid (e.g. {id:'B2'} from body_list). STEP/STL only. Selected STL uses mm.")] EntityRef? body = null,
         [Description("Document (handle, title or path); default: the target document.")] string? doc = null,
         CancellationToken cancellationToken = default) =>
         Output.Json(_svc.ExportAsync(new ExportRequest
         {
             Path = path, Format = format, StepAp = stepAp, StlBinary = stlBinary, StlQuality = stlQuality,
-            StlDeviationMm = stlDeviationMm, StlAngleDeg = stlAngleDeg, Overwrite = overwrite, Doc = doc,
+            StlDeviationMm = stlDeviationMm, StlAngleDeg = stlAngleDeg, Body = body, Overwrite = overwrite, Doc = doc,
         }, cancellationToken), progress, "model_export");
 
     [McpServerTool(Name = "model_export_all", Title = "Release package (batch export)", ReadOnly = false, Destructive = true, Idempotent = false, OpenWorld = false)]

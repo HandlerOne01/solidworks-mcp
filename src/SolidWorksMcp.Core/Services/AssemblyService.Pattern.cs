@@ -601,15 +601,15 @@ public sealed partial class AssemblyService
     }
 
     /// <summary>
-    /// Each seed got one new component on its opposite-hand file, written by this call, whose part holds the seed part's
-    /// volume and whose vertices, in the assembly, are the seed's vertices reflected about the plane: a mirror image, which
-    /// a turned copy of a handed part can't be.
+    /// Each seed got one new component on its opposite-hand file. Its vertices must reflect the seed in assembly space.
+    /// If the mass-property volumes disagree, the solid bodies must independently coincide at that reflection.
     /// </summary>
     private static string? CheckOppositeHand(SwContext ctx, List<IComponent2> seeds, List<IComponent2> fresh, PatternRef plane, OppositeHandPlan hand,
         List<string> checks)
     {
         var mu = ctx.Math;
-        int vertices = 0;
+        int vertices = 0, checkedVertices = 0;
+        var confirmedByCoincidence = new List<string>();
         for (int k = 0; k < seeds.Count; k++)
         {
             string file = System.IO.Path.GetFileName(hand.Targets[k]);
@@ -627,15 +627,62 @@ public sealed partial class AssemblyService
                 var want = Reflect(mu.AsmMapPoint(seeds[k].Transform2, seedPts[i]), plane.P, plane.U);
                 if (!got.Any(g => g.DistanceTo(want) <= PosTol * 10))
                     return $"'{c.Name2}' has no vertex at [{Pt(want)}], the reflection of a vertex of '{seeds[k].Name2}': it is not the seed's mirror image";
+                checkedVertices++;
             }
             double v0 = PartVolume(seeds[k]), v1 = PartVolume(c);
-            if (Math.Abs(v1 - v0) > 1e-6 * v0 + 1e-15) return $"'{c.Name2}' holds {Units.Mm3(v1)} mm³, its seed {Units.Mm3(v0)} mm³";
+            if (!TryVerifyOppositeHandVolume(v0, v1, () => OppositeHandBodiesCoincide(mu, seeds[k], c, plane), out bool usedCoincidence))
+                return $"'{c.Name2}' holds {Units.Mm3(v1)} mm³, its seed {Units.Mm3(v0)} mm³, and the reflected bodies could not be confirmed to coincide";
+            if (usedCoincidence) confirmedByCoincidence.Add(c.Name2);
             vertices += seedPts.Count;
         }
+        string vertexEvidence = checkedVertices == vertices ? $"all {vertices} vertices reflected" : $"{checkedVertices} of {vertices} sampled vertices reflected";
+        string shapeEvidence = confirmedByCoincidence.Count == 0 ? "the same volume"
+            : $"solid bodies confirmed by coincidence for {string.Join(", ", confirmedByCoincidence)} despite differing mass-property volumes";
         checks.Add($"each new part file ({string.Join(", ", hand.Targets.Select(System.IO.Path.GetFileName))}) is placed as the mirror image of its seed " +
-                   $"about the plane through [{Pt(plane.P)}] with normal [{Dir(plane.U)}]: all {vertices} vertices reflected, the same volume");
+                   $"about the plane through [{Pt(plane.P)}] with normal [{Dir(plane.U)}]: {vertexEvidence}, {shapeEvidence}");
         return null;
     }
+
+    internal static bool TryVerifyOppositeHandVolume(double seed, double copy, Func<bool> confirmCoincidence, out bool usedCoincidence)
+    {
+        usedCoincidence = !(double.IsFinite(seed) && double.IsFinite(copy) && seed > 0 && copy > 0 &&
+            Math.Abs(copy - seed) <= 1e-6 * seed + 1e-15);
+        return !usedCoincidence || confirmCoincidence();
+    }
+
+    private static bool OppositeHandBodiesCoincide(IMathUtility mu, IComponent2 seed, IComponent2 copy, PatternRef plane)
+    {
+        var originals = CoincidenceBodies(seed);
+        var remaining = CoincidenceBodies(copy);
+        if (originals.Count == 0 || originals.Count != remaining.Count) return false;
+        var seedTransform = seed.Transform2;
+        var copyTransform = copy.Transform2;
+        if (seedTransform is null || copyTransform is null) return false;
+        Vec3 Expected(Vec3 p) => Reflect(mu.AsmMapPoint(copyTransform, p), plane.P, plane.U);
+
+        foreach (var body in originals)
+        {
+            int index = remaining.FindIndex(candidate =>
+                // The API returns the transform that brings the input (copy) body onto this (seed) body.
+                body.GetCoincidenceTransform2(candidate, out var alignment) && alignment is not null &&
+                OppositeHandAlignmentMatches(Expected, p => mu.AsmMapPoint(seedTransform, mu.AsmMapPoint(alignment, p))));
+            if (index < 0) return false;
+            remaining.RemoveAt(index);
+        }
+        return true;
+    }
+
+    private static List<IBody2> CoincidenceBodies(IComponent2 component)
+    {
+        if (component.AsmModelDoc() is not IPartDoc part ||
+            ((IModelDoc2)part).ConfigurationManager.ActiveConfiguration?.Name != component.ReferencedConfiguration)
+            return [];
+        return part.Bodies(swBodyType_e.swSolidBody, visibleOnly: false);
+    }
+
+    /// <summary>Affine transforms agree when they agree at the origin and three independent basis points.</summary>
+    internal static bool OppositeHandAlignmentMatches(Func<Vec3, Vec3> expected, Func<Vec3, Vec3> actual) =>
+        new[] { Vec3.Zero, Vec3.UnitX, Vec3.UnitY, Vec3.UnitZ }.All(p => expected(p).DistanceTo(actual(p)) <= PosTol * 10);
 
     /// <summary>The vertices of a part component's solid bodies, in part space.</summary>
     private static List<Vec3> PartVertices(IComponent2 c) =>

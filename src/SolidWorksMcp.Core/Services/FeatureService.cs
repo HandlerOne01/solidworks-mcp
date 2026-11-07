@@ -21,6 +21,7 @@ public sealed record ExtrudeRequest
     public bool Merge { get; init; } = true;
     public double? DraftDeg { get; init; }
     public bool DraftOutward { get; init; }
+    public double? ThinThicknessMm { get; init; }
     public string? Name { get; init; }
     public bool KeepOnFailure { get; init; }
 }
@@ -29,6 +30,7 @@ public sealed record ExtrudeRequest
 public sealed partial class FeatureService(SwSession session)
 {
     private static readonly FeatureSpec BossSpec = new("feature_extrude", ["Extrusion", "ICE", "Boss", "BossThin"], VolumeRule.Increase);
+    private static readonly FeatureSpec ThinBossSpec = BossSpec with { Types = ["ExtruThin", .. BossSpec.Types] };
     private static readonly FeatureSpec CutSpec = new("feature_extrude", ["Cut", "ICE", "CutThin"], VolumeRule.Decrease);
     private static readonly FeatureSpec FilletSpec = new("feature_fillet", ["Fillet"], VolumeRule.Change);
 
@@ -51,18 +53,24 @@ public sealed partial class FeatureService(SwSession session)
             }
             if (q.DraftDeg is double dd && (!double.IsFinite(dd) || dd < 0 || dd >= 89))
                 throw SwException.InvalidArgument("draftDeg must be between 0 and 89.");
+            double? thinThickness = ThinThicknessM(q, end);
 
             // The profile: the server's open sketch (closed first), else the named one, else the last one finished.
             var (sketchFeat, sketch) = ProfileSketch(ctx, d, q.Sketch);
-            var contours = SketchService.Contours(sketch);
-            if (contours.ClosedContours == 0)
-                throw SwException.InvalidArgument($"Sketch '{sketchFeat.Name}' has no closed contour ({contours.Status}{(contours.Problem is null ? "" : ", " + contours.Problem)}).",
-                    "Close the profile (rectangle, circle, closed polyline) before extruding.");
+            if (thinThickness is null)
+            {
+                var contours = SketchService.Contours(sketch);
+                if (contours.ClosedContours == 0)
+                    throw SwException.InvalidArgument($"Sketch '{sketchFeat.Name}' has no closed contour ({contours.Status}{(contours.Problem is null ? "" : ", " + contours.Problem)}).",
+                        "Close the profile (rectangle, circle, closed polyline) before extruding.");
+            }
 
+            var before = Snapshot.Take(d);
+            if (thinThickness is not null)
+                CheckThinProfile(sketch, sketchFeat.Name, before.SolidBodies == 0);
             var s2m = SketchService.SketchToModel(sketch);
             var origin = s2m.ApplyPoint(Vec3.Zero);
             var normal = s2m.ApplyVector(Vec3.UnitX).Cross(s2m.ApplyVector(Vec3.UnitY)).Normalized();
-            var before = Snapshot.Take(d);
             bool alongNormal = ResolveDirection(q, normal, origin, before, end);
             var dirModel = alongNormal ? normal : -normal;
             // API flag: bosses go along the sketch normal by default; cuts go against it by default.
@@ -79,29 +87,79 @@ public sealed partial class FeatureService(SwSession session)
             bool draft = q.DraftDeg is > 0;
             double draftRad = draft ? Units.Rad(q.DraftDeg!.Value) : 0;
 
-            d.ClearSelection2(true);
-            if (!sketchFeat.Select2(false, 0))
-                throw new SwException(ErrorCodes.FeatureFailed, $"Could not select sketch '{sketchFeat.Name}'.");
-            var fm = d.FeatureManager;
-            object? api = q.Cut
-                ? fm.FeatureCut4(sd, false, dirFlag, t1, t2, depth, depth, draft, false, q.DraftOutward, false, draftRad, 0,
-                    false, false, false, false, false, true, true, true, true, false,
-                    (int)swStartConditions_e.swStartSketchPlane, 0, false, false)
-                : fm.FeatureExtrusion3(sd, false, dirFlag, t1, t2, depth, depth, draft, false, q.DraftOutward, false, draftRad, 0,
-                    false, false, false, false, q.Merge, true, true,
-                    (int)swStartConditions_e.swStartSketchPlane, 0, false);
-            d.ClearSelection2(true);
+            try
+            {
+                object? api;
+                d.ClearSelection2(true);
+                try
+                {
+                    if (!sketchFeat.Select2(false, 0))
+                        throw new SwException(ErrorCodes.FeatureFailed, $"Could not select sketch '{sketchFeat.Name}'.");
+                    var fm = d.FeatureManager;
+                    if (thinThickness is double wall)
+                    {
+                        // Thk1 is the total thickness. SOLIDWORKS offsets half of it to each side in mid-plane mode.
+                        api = fm.FeatureExtrusionThin2(true, false, dirFlag, t1, t2, depth, 0,
+                            false, false, false, false, 0, 0, false, false, false, false, q.Merge,
+                            wall, 0, 0, (int)swThinWallType_e.swThinWallMidPlane, 0, false, 0,
+                            true, true, (int)swStartConditions_e.swStartSketchPlane, 0, false);
+                    }
+                    else
+                    {
+                        api = q.Cut
+                            ? fm.FeatureCut4(sd, false, dirFlag, t1, t2, depth, depth, draft, false, q.DraftOutward, false, draftRad, 0,
+                                false, false, false, false, false, true, true, true, true, false,
+                                (int)swStartConditions_e.swStartSketchPlane, 0, false, false)
+                            : fm.FeatureExtrusion3(sd, false, dirFlag, t1, t2, depth, depth, draft, false, q.DraftOutward, false, draftRad, 0,
+                                false, false, false, false, q.Merge, true, true,
+                                (int)swStartConditions_e.swStartSketchPlane, 0, false);
+                    }
+                }
+                finally
+                {
+                    d.ClearSelection2(true);
+                }
 
-            var o = FeatureVerifier.Check(ctx, d, before, q.Cut ? CutSpec : BossSpec,
-                (main, after, checks) => ExtrudeIntent(main, end, depth, origin, dirModel, q.Cut, checks),
-                q.KeepOnFailure, api);
-            entry.LastSketch = null; // consumed
-            Rename(ctx, o.Main, q.Name);
-            return FeatureVerifier.Result(ctx, d, o, sketchFeat.Name, dirModel);
+                var spec = thinThickness is not null ? ThinBossSpec : q.Cut ? CutSpec : BossSpec;
+                var o = FeatureVerifier.Check(ctx, d, before, spec,
+                    (main, after, checks) => ExtrudeIntent(main, end, depth, origin, dirModel, q.Cut, checks, thinThickness),
+                    q.KeepOnFailure, api);
+                Rename(ctx, o.Main, q.Name);
+                var result = FeatureVerifier.Result(ctx, d, o, sketchFeat.Name, dirModel);
+                entry.LastSketch = null; // consumed
+                return result;
+            }
+            catch (Exception ex) when (thinThickness is not null && !q.KeepOnFailure && !ComArgs.IsDisconnect(ex))
+            {
+                BodyKit.CleanUp(ctx, d, before);
+                throw;
+            }
         }, RunOptions.Write(q.Doc), ct);
 
+    internal static double? ThinThicknessM(ExtrudeRequest q, string end)
+    {
+        if (q.ThinThicknessMm is not double thickness) return null;
+        double meters = Units.PositiveM(thickness, "thinThicknessMm");
+        if (q.Cut || end != "blind" || q.DraftDeg is not (null or 0))
+            throw SwException.InvalidArgument("'thinThicknessMm' supports blind bosses without draft.");
+        return meters;
+    }
+
+    private static void CheckThinProfile(ISketch sketch, string name, bool isBase)
+    {
+        if (sketch.Is3D()) throw SwException.InvalidArgument("A thin extrusion needs a 2D sketch.");
+        int open = 0, closed = 0;
+        int usage = isBase ? (int)swSketchCheckFeatureProfileUsage_e.swSketchCheckFeature_BASEEXTRUDETHIN
+            : (int)swSketchCheckFeatureProfileUsage_e.swSketchCheckFeature_BOSSEXTRUDETHIN;
+        int status = sketch.CheckFeatureUse(usage, ref open, ref closed);
+        if (status != (int)swSketchCheckFeatureStatus_e.swSketchCheckFeatureStatus_OK || open + closed == 0)
+            throw SwException.InvalidArgument($"Sketch '{name}' is not a valid thin extrusion profile ({(swSketchCheckFeatureStatus_e)status}).",
+                "Use one open chain or a closed contour in a 2D sketch.");
+    }
+
     /// <summary>Tier B: a cap face of the new feature lies at the requested depth along the direction.</summary>
-    private static IEnumerable<string> ExtrudeIntent(IFeature main, string end, double depth, Vec3 origin, Vec3 dir, bool cut, List<string> checks)
+    private static IEnumerable<string> ExtrudeIntent(IFeature main, string end, double depth, Vec3 origin, Vec3 dir, bool cut,
+        List<string> checks, double? thinThickness)
     {
         if (end is not ("blind" or "mid_plane")) yield break;
         var expect = end == "mid_plane" ? new[] { depth / 2, -depth / 2 } : new[] { depth };
@@ -121,6 +179,20 @@ public sealed partial class FeatureService(SwSession session)
                 yield return $"no {(cut ? "floor" : "cap")} face at {Units.Mm(e)} mm along [{TopoQuery.Fmt(Units.Unit(dir))}]" +
                              (offsets.Count == 0 ? "" : $" (planar faces at {string.Join(", ", offsets.Select(x => Units.Mm(x)))} mm)");
         }
+        if (thinThickness is not double wall) yield break;
+        if (main.Definition() is not IExtrudeFeatureData2 data || !data.IsThinFeature()
+            || data.ThinWallType != (int)swThinWallType_e.swThinWallMidPlane)
+        {
+            yield return "the result is not a centered thin extrusion";
+            yield break;
+        }
+        const double wallTolerance = 1e-6; // m
+        double forward = data.GetWallThickness(true);
+        if (Math.Abs(forward - wall) <= wallTolerance
+            || (Math.Abs(forward - wall / 2) <= wallTolerance && Math.Abs(data.GetWallThickness(false) - wall / 2) <= wallTolerance))
+            checks.Add($"centered thin wall of {Units.Mm(wall)} mm");
+        else
+            yield return $"wall thickness did not read back as {Units.Mm(wall)} mm";
     }
 
     /// <summary>True when the feature goes along the sketch normal.</summary>
