@@ -798,7 +798,12 @@ public sealed class ExportService(SwSession session)
                 PrefAudit.Check(ctx, options); // after the scope restored its own changes
             }
             written = ok ? WaitForFile(full) : ActualFile(full);
-            if (!ok)
+            // Some SOLIDWORKS 2024 installs write the PDF completely but still
+            // return swGenericSaveError. Do not discard a potentially valid PDF:
+            // the freshness, size, PDF signature and EOF checks below still gate it.
+            bool verifyGenericPdf = !ok && f.Name == "pdf" &&
+                errors == (int)swFileSaveError_e.swGenericSaveError && written is not null;
+            if (!ok && !verifyGenericPdf)
                 throw new SwException(ErrorCodes.IoError, $"SOLIDWORKS could not export '{full}' ({DocumentService.SaveErrors(errors)}).", SaveHint(errors, f));
             if (written is null)
                 throw new SwException(ErrorCodes.VerifyFailed, $"SOLIDWORKS reported success but did not write '{System.IO.Path.GetFileName(full)}'.{Strays(dir, before, start)}",
@@ -826,6 +831,9 @@ public sealed class ExportService(SwSession session)
                     $"The exported '{System.IO.Path.GetFileName(written)}' failed verification: {string.Join("; ", problems)}. {removed}",
                     f.Name == "stl" ? "Retry with other stl* options, or check the model (model_info)." : "Check the model (model_info), or try another format.");
             }
+            if (verifyGenericPdf)
+                ctx.Warn("SOLIDWORKS returned swGenericSaveError although it wrote a fresh PDF with a valid signature and EOF. " +
+                         "The PDF passed file verification; review its rendered content before using it.");
             if (warnings != 0) ctx.Warn($"Export warnings: {DocumentService.SaveWarnings(warnings)}.");
             details.Checks = [$"new file written by this call ({fi.Length} bytes)", .. details.Checks ?? []];
             ctx.Paths.RecordWritten(written);

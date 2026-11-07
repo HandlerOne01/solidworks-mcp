@@ -27,13 +27,25 @@ public sealed class SketchEditTools(SwSession session)
 
     [McpServerTool(Name = "sketch_info", Title = "Sketch info", ReadOnly = true, Destructive = false, Idempotent = true, OpenWorld = false)]
     [Description("Reads a sketch: segments (name, kind line/arc/circle/ellipse/spline/text, construction, geometry in sketch mm: line start/end, " +
-                 "arc center/radius/start/end, length), point and relation counts, constrained status (under/fully/over), contour status " +
+                 "arc center/radius/start/end, length, spline fitPointsMm), point and relation counts, constrained status (under/fully/over), contour status " +
                  "(closed/open loops, regions), frame and dimensions (D1@Sketch1 with values).")]
     public async Task<string> SketchInfo(
         [Description("Sketch name, e.g. Sketch1; default: the open sketch.")] string? sketch = null,
         [Description(DocDescription)] string? doc = null,
         CancellationToken cancellationToken = default) =>
         ResultJson.Serialize(await _svc.InfoAsync(doc, sketch, cancellationToken));
+
+    [McpServerTool(Name = "sketch_spline_edit", Title = "Edit spline fit points", ReadOnly = false, Destructive = false, Idempotent = true, OpenWorld = false)]
+    [Description("Moves existing fit points of one spline in the server's open sketch. Use the indexes from sketch_info. " +
+                 "Verifies coordinates, spline and point identities and relation count. A refused move triggers a restore attempt; " +
+                 "the error reports whether the original sketch was recovered.")]
+    public async Task<string> SketchSplineEdit(
+        [Description("Spline segment, usually {name:'Spline1'} from sketch_info.")] EntityRef spline,
+        [Description("Fit-point moves in mm. Use [x,y] sketch coordinates in 2D and [x,y,z] model coordinates in 3D.")]
+        IReadOnlyList<SplineFitPointMove> moves,
+        [Description(DocDescription)] string? doc = null,
+        CancellationToken cancellationToken = default) =>
+        ResultJson.Serialize(await _svc.SplineEditAsync(doc, spline, moves, cancellationToken));
 
     [McpServerTool(Name = "sketch_dimension_add", Title = "Add sketch dimension", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false)]
     [Description("Adds a driving dimension in the open sketch and sets its value (no Modify dialog). kind: linear (a line's length, or the distance " +

@@ -121,6 +121,78 @@ public class SketchEditLiveTests(LiveFixture fx) : LiveTest(fx)
     // ------------------------------------------------------------------ sketch_info
 
     [Fact]
+    public async Task Spline_edit_moves_indexed_fit_points_in_top_sketch_coordinates()
+    {
+        var spline = new SketchEntity { Kind = "spline", Points = [[2, 4], [15, 8], [28, -3], [42, 6]] };
+        var (doc, sketch, added) = await SketchAsync("edit_fit_points_2d", "top", spline);
+        string name = Name(added, 0);
+        var before = await Ed.InfoAsync(doc, null);
+        var original = Assert.Single(before.Segments);
+        Assert.Equal(4, original.FitPointsMm!.Length);
+
+        var edit = await Ed.SplineEditAsync(doc, Seg(name),
+        [
+            new() { Index = 1, AtMm = [14, 13] },
+            new() { Index = 2, AtMm = [29, -7] },
+        ]);
+
+        Assert.Equal(2, edit.Moved);
+        Assert.Equal("sketch", edit.CoordinateSpace);
+        Assert.Equal(name, edit.Spline.Name);
+        Near([14, 13], edit.Spline.FitPointsMm![1]);
+        Near([29, -7], edit.Spline.FitPointsMm[2]);
+        Assert.Equal(before.Relations, (await Ed.InfoAsync(doc, null)).Relations);
+        await Sk.FinishAsync(doc);
+
+        var after = Assert.Single((await Ed.InfoAsync(doc, sketch)).Segments);
+        Assert.Equal(name, after.Name);
+        Assert.Equal(4, after.FitPointsMm!.Length);
+        Near([2, 4], after.FitPointsMm[0]);
+        Near([14, 13], after.FitPointsMm[1]);
+        Near([29, -7], after.FitPointsMm[2]);
+        Near([42, 6], after.FitPointsMm[3]);
+    }
+
+    [Fact]
+    public async Task Spline_edit_reads_model_coordinates_in_3d()
+    {
+        string doc = await NewPartAsync("edit_fit_points_3d");
+        await Sk.StartAsync(doc, null, true);
+        var added = await Sk.AddAsync(doc,
+            [new SketchEntity { Kind = "spline", Points = [[3, 5, 2], [15, 8, 7], [28, 12, -3], [42, 6, 10]] }]);
+        string name = Name(added, 0);
+        var edit = await Ed.SplineEditAsync(doc, Seg(name), [new() { Index = 1, AtMm = [14, 13, 11] }]);
+
+        Assert.Equal("model", edit.CoordinateSpace);
+        Assert.Equal(name, edit.Spline.Name);
+        Near([14, 13, 11], (await SegmentAsync(doc, name)).FitPointsMm![1]);
+        await Sk.FinishAsync(doc);
+    }
+
+    [Fact]
+    public async Task Spline_edit_preflights_every_index_and_restores_a_refused_batch()
+    {
+        var spline = new SketchEntity { Kind = "spline", Points = [[2, 4], [15, 8], [28, -3], [42, 6]] };
+        var (doc, _, added) = await SketchAsync("edit_fit_points_refused", "front", spline);
+        string name = Name(added, 0);
+        await Ed.RelationAddAsync(doc, "fix", [At(42, 6)]);
+        var before = await Ed.InfoAsync(doc, null);
+
+        await Fails(ErrorCodes.InvalidArgument, () => Ed.SplineEditAsync(doc, Seg(name),
+            [new() { Index = 1, AtMm = [14, 13] }, new() { Index = 4, AtMm = [45, 9] }]));
+        Near([15, 8], (await SegmentAsync(doc, name)).FitPointsMm![1]);
+
+        await Fails(ErrorCodes.VerifyFailed, () => Ed.SplineEditAsync(doc, Seg(name),
+            [new() { Index = 1, AtMm = [14, 13] }, new() { Index = 3, AtMm = [45, 9] }]));
+        var after = await Ed.InfoAsync(doc, null);
+        Assert.Equal(before.Relations, after.Relations);
+        Assert.Equal(name, Assert.Single(after.Segments).Name);
+        Near([15, 8], after.Segments[0].FitPointsMm![1]);
+        Near([42, 6], after.Segments[0].FitPointsMm![3]);
+        await Sk.FinishAsync(doc);
+    }
+
+    [Fact]
     public async Task Info_lists_segments_contours_frame_and_dimensions()
     {
         var (doc, sketch, added) = await SketchAsync("info", "front", Rect(100, 60), Circle([0, 0], 10));

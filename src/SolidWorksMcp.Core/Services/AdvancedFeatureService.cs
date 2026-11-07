@@ -44,6 +44,16 @@ public sealed record LoftRequest
     public bool KeepOnFailure { get; init; }
 }
 
+/// <summary>surface_loft options.</summary>
+public sealed record SurfaceLoftRequest
+{
+    public string? Doc { get; init; }
+    public IReadOnlyList<EntityRef>? Profiles { get; init; }
+    public IReadOnlyList<EntityRef>? Guides { get; init; }
+    public string? Name { get; init; }
+    public bool KeepOnFailure { get; init; }
+}
+
 /// <summary>feature_helix options.</summary>
 public sealed record HelixRequest
 {
@@ -467,6 +477,74 @@ public sealed class AdvancedFeatureService(SwSession session)
             return FeatureVerifier.Result(ctx, d, o, sketches.Count == 0 ? null : string.Join(", ", sketches), null, resolved);
         }, RunOptions.Write(q.Doc) with { Timeout = Long }, ct);
 
+    private static readonly FeatureSpec SurfaceLoftSpec = new("surface_loft", ["BlendRefSurface"], VolumeRule.Any);
+
+    public Task<BodyResult> SurfaceLoftAsync(SurfaceLoftRequest q, CancellationToken ct = default) =>
+        session.RunAsync("surface_loft", ctx =>
+        {
+            var part = ctx.Part();
+            var d = (IModelDoc2)part;
+            if (q.Profiles is not { Count: >= 2 and <= 50 })
+                throw SwException.InvalidArgument("'profiles' needs 2 to 50 sketch references in loft order.");
+            if (q.Guides is { Count: > 20 })
+                throw SwException.InvalidArgument("'guides' accepts at most 20 guide curves.");
+            NoNullRefs(q.Profiles, "profiles");
+            NoNullRefs(q.Guides, "guides");
+            CloseServerSketch(ctx, d, RefNames([.. q.Profiles, .. q.Guides ?? []]));
+
+            var profiles = q.Profiles.Select((reference, i) =>
+                EntityResolver.Resolve(ctx, d, reference, $"profiles[{i}]", EntityKind.Sketch)).ToList();
+            if (profiles.Select(p => p.Id ?? p.Label).Distinct().Count() != profiles.Count)
+                throw SwException.InvalidArgument("'profiles' must contain distinct sketches.");
+            var guideRefs = q.Guides is { Count: > 0 }
+                ? EntityResolver.ResolveAll(ctx, d, q.Guides, "guides", EntityKind.Sketch, EntityKind.Edge, EntityKind.Feature)
+                : [];
+            var sections = profiles.Select((p, i) =>
+                (Label: p.Label, Points: LoftProfilePoints(p, $"profiles[{i}]", allowOpen: true))).ToList();
+            var guides = guideRefs.Select((g, i) => PathOf(d, g, $"guides[{i}]")).ToList();
+            var picks = profiles.Select(p => new Pick(p.Label, (doc, mark) => SelectSketch(doc, (IFeature)p.Obj, mark), ProfileMark))
+                .Concat(guides.Select(g => new Pick(g.Label, g.Select, GuideMark))).ToList();
+            var resolved = profiles.Select((p, i) => p.Info($"profiles[{i}]"))
+                .Concat(guideRefs.Select((g, i) => g.Info($"guides[{i}]"))).ToList();
+            var geomsBefore = BodyKit.AllGeoms(ctx, part, d);
+
+            using var prefs = ctx.SystemPrefs();
+            prefs.Toggle(SystemPrefIds.ShowErrorsEveryRebuild, false);
+            var before = Snapshot.Take(d);
+            try
+            {
+                try
+                {
+                    SelectAll(d, picks);
+                    d.InsertLoftRefSurface2(false, true, false, 1.0, 0, 0);
+                }
+                finally
+                {
+                    d.ClearSelection2(true);
+                }
+
+                var outcome = BodyKit.Verify(ctx, d, before, SurfaceLoftSpec, (main, after, checks) =>
+                {
+                    var problems = LoftProfileMisses(main, sections);
+                    if (after.Bodies != before.Bodies + 1 || after.SolidBodies != before.SolidBodies)
+                        problems.Add("expected one new surface body and an unchanged solid count");
+                    if (problems.Count == 0)
+                        checks.Add($"one new surface body through all {sections.Count} profiles");
+                    return problems;
+                }, q.KeepOnFailure, null, "Use one connected contour per sketch, in order, with guides that meet every profile.");
+                var sketches = profiles.Select(p => ((IFeature)p.Obj).Name).ToArray();
+                Consumed(ctx, sketches);
+                Rename(ctx, outcome.Main, q.Name);
+                return BodyKit.Result(ctx, d, outcome, BodyKit.NewOrChanged(geomsBefore, BodyKit.AllGeoms(ctx, part, d)), resolved,
+                    method: "InsertLoftRefSurface2", consumedSketch: string.Join(", ", sketches));
+            }
+            catch (Exception ex) when (!q.KeepOnFailure && !ComArgs.IsDisconnect(ex))
+            {
+                BodyKit.CleanUp(ctx, d, before);
+                throw;
+            }
+        }, RunOptions.Write(q.Doc) with { Timeout = Long }, ct);
+
     /// <summary>
     /// Tier B: the loft's faces pass through every profile (each section's boundary lies on them). A boss that merged
     /// with existing material may have lost faces inside it, so there a miss is a warning, not a failure.
@@ -479,15 +557,7 @@ public sealed class AdvancedFeatureService(SwSession session)
             checks.Add("profiles not checked (a cut keeps only what lies inside the body)");
             return [];
         }
-        var faces = FeatureFaces(main);
-        var misses = new List<string>();
-        foreach (var (label, pts) in sections)
-        {
-            double worst = 0;
-            foreach (var p in pts)
-                worst = Math.Max(worst, faces.Count == 0 ? double.MaxValue : faces.Min(f => Topology.DistanceToFace(f, p)));
-            if (worst > OnFaceTol) misses.Add($"{label} lies up to {F(Units.Mm(worst))} mm off the loft's faces");
-        }
+        var misses = LoftProfileMisses(main, sections);
         if (misses.Count == 0)
         {
             checks.Add($"the loft's faces pass through all {sections.Count} profiles");
@@ -500,19 +570,46 @@ public sealed class AdvancedFeatureService(SwSession session)
         return [];
     }
 
+    private static List<string> LoftProfileMisses(IFeature main, List<(string Label, List<Vec3> Points)> sections)
+    {
+        var faces = FeatureFaces(main);
+        if (faces.Count == 0) return ["the loft has no faces to verify"];
+        var misses = new List<string>();
+        foreach (var (label, points) in sections)
+        {
+            double worst = 0;
+            foreach (var point in points)
+                worst = Math.Max(worst, faces.Min(f => Topology.DistanceToFace(f, point)));
+            if (worst > OnFaceTol) misses.Add($"{label} lies up to {F(Units.Mm(worst))} mm off the loft's faces");
+        }
+        return misses;
+    }
+
     /// <summary>Points on a loft profile in model space (at most 24): segment ends and midpoints, or a face's edge points.</summary>
-    private static List<Vec3> LoftProfilePoints(Resolved r, string arg)
+    private static List<Vec3> LoftProfilePoints(Resolved r, string arg, bool allowOpen = false)
     {
         switch (r.Obj)
         {
             case IFeature f when r.Kind == EntityKind.Sketch && f.Specific() is ISketch sk:
             {
-                var contours = SketchService.Contours(sk);
-                if (contours.ClosedContours == 0)
-                    throw SwException.InvalidArgument($"'{arg}' ({r.Label}) is not a closed profile ({contours.Status}).",
-                        "Loft profiles are closed sketches or faces; open curves go in 'guides'.");
+                var segs = SketchSegs(sk, out _, sample3dCircles: allowOpen);
+                if (allowOpen)
+                {
+                    if (segs.Count != sk.Segments().Count(s => !s.ConstructionGeometry))
+                        throw SwException.InvalidArgument($"'{arg}' ({r.Label}) contains a sketch segment that cannot be verified.");
+                    var chains = AdvancedFeatureLogic.Chains(segs);
+                    if (chains.Branched || chains.Chains.Count != 1)
+                        throw SwException.InvalidArgument($"'{arg}' ({r.Label}) needs one connected, unbranched contour.");
+                }
+                else
+                {
+                    var contours = SketchService.Contours(sk);
+                    if (contours.ClosedContours == 0)
+                        throw SwException.InvalidArgument($"'{arg}' ({r.Label}) is not a closed profile ({contours.Status}).",
+                            "Loft profiles are closed sketches or faces; open curves go in 'guides'.");
+                }
                 var xf = sk.Is3D() ? Xform.Identity : SketchService.SketchToModel(sk);
-                return Spread(SketchSegs(sk, out _).SelectMany(s => s.Samples).ToList(), 24).Select(xf.ApplyPoint).ToList();
+                return Spread(segs.SelectMany(s => s.Samples).ToList(), 24).Select(xf.ApplyPoint).ToList();
             }
             case IFace2 face:
                 return Spread(face.Edges().Select(Topology.Describe).SelectMany(g => new[] { g.Start, g.Mid }).ToList(), 24);
@@ -1096,7 +1193,7 @@ public sealed class AdvancedFeatureService(SwSession session)
     /// A sketch's non-construction segments as chain pieces (2D: sketch coordinates; 3D: model). Lines, arcs, circles
     /// and full ellipses are exact; splines (fit points), partial ellipses and 3D arcs are approximations.
     /// </summary>
-    private static List<AdvancedFeatureLogic.Seg> SketchSegs(ISketch sk, out bool exactShapes)
+    private static List<AdvancedFeatureLogic.Seg> SketchSegs(ISketch sk, out bool exactShapes, bool sample3dCircles = false)
     {
         bool is3D = sk.Is3D();
         var list = new List<AdvancedFeatureLogic.Seg>();
@@ -1115,7 +1212,8 @@ public sealed class AdvancedFeatureService(SwSession session)
                     double r = arc.GetRadius();
                     if (arc.IsCircle() != 0)
                     {
-                        list.Add(AdvancedFeatureLogic.Seg.Circle(P(c), r));
+                        Vec3? normal = is3D && sample3dCircles ? Vec3.From((object?)arc.GetNormalVector()) : null;
+                        list.Add(AdvancedFeatureLogic.Seg.Circle(P(c), r, normal));
                         if (is3D) exactShapes = false;
                         break;
                     }
@@ -1304,9 +1402,13 @@ internal static class AdvancedFeatureLogic
         }
 
         /// <summary>A full circle, counter-clockwise.</summary>
-        public static Seg Circle(Vec3 c, double r)
+        public static Seg Circle(Vec3 c, double r, Vec3? normal = null)
         {
-            var pts = Enumerable.Range(0, 65).Select(i => new Vec3(c.X + r * Math.Cos(Math.PI * i / 32), c.Y + r * Math.Sin(Math.PI * i / 32), c.Z)).ToList();
+            var n = normal?.Normalized() ?? Vec3.UnitZ;
+            var u = (Math.Abs(n.Z) < 0.9 ? Vec3.UnitZ : Vec3.UnitY).Cross(n).Normalized();
+            var v = n.Cross(u);
+            var pts = Enumerable.Range(0, 65).Select(i =>
+                c + u * (r * Math.Cos(Math.PI * i / 32)) + v * (r * Math.Sin(Math.PI * i / 32))).ToList();
             return new Seg { Kind = "circle", A = pts[0], B = pts[0], Closed = true, Green = Math.PI * r * r, Length = 2 * Math.PI * r, Samples = pts };
         }
 

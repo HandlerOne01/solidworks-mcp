@@ -448,7 +448,7 @@ public sealed partial class DrawingService(SwSession session)
             if (box is null)
             {
                 // The model isn't open: the first view loads it, then the layout can use its box.
-                var first = drw.CreateDrawViewFromModelView3(path, DrawingLayout.NamedViews[names[0]].Api, Units.M(usable.Cx), Units.M(usable.Cy), 0)
+                var first = CreateStandardView(drw, path, names[0], Units.M(usable.Cx), Units.M(usable.Cy))
                             ?? throw new SwException(ErrorCodes.FeatureFailed, $"SOLIDWORKS created no {names[0]} view of '{Path.GetFileName(path)}'.",
                                 "Check that the file is a part or assembly that opens in SOLIDWORKS.");
                 created.Add((names[0], first));
@@ -486,7 +486,7 @@ public sealed partial class DrawingService(SwSession session)
                 }
                 else
                 {
-                    v = drw.CreateDrawViewFromModelView3(path, DrawingLayout.NamedViews[slot.View].Api, x, y, 0)
+                    v = CreateStandardView(drw, path, slot.View, x, y)
                         ?? throw new SwException(ErrorCodes.FeatureFailed, $"SOLIDWORKS created no {slot.View} view of '{Path.GetFileName(path)}'.");
                     created.Add((slot.View, v));
                 }
@@ -533,6 +533,26 @@ public sealed partial class DrawingService(SwSession session)
         {
             throw Rolled(ex, DeleteViews(d, created.Select(c => SafeName(c.View))));
         }
+    }
+
+    // Standard view names are localized by SOLIDWORKS. Keep the English path first,
+    // then retry the names read back from a Simplified Chinese installation.
+    private static IView? CreateStandardView(IDrawingDoc drawing, string path, string view, double x, double y)
+    {
+        IView? made = drawing.CreateDrawViewFromModelView3(path, DrawingLayout.NamedViews[view].Api, x, y, 0);
+        if (made is not null) return made;
+        string? localized = view switch
+        {
+            "front" => "*前视",
+            "back" => "*后视",
+            "left" => "*左视",
+            "right" => "*右视",
+            "top" => "*上视",
+            "bottom" => "*下视",
+            "iso" => "*等轴测",
+            _ => null,
+        };
+        return localized is null ? null : drawing.CreateDrawViewFromModelView3(path, localized, x, y, 0);
     }
 
     private static string SafeName(IView v)

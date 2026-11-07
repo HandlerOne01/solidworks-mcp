@@ -24,6 +24,8 @@ public sealed class SketchSegmentInfo
     public double? RadiusMm { get; init; }
     public double? MajorRadiusMm { get; init; }
     public double? MinorRadiusMm { get; init; }
+    /// <summary>Ordered spline fit points in sketch mm, or model mm for a 3D sketch.</summary>
+    public double[][]? FitPointsMm { get; init; }
     public double? LengthMm { get; init; }
     /// <summary>In 'changed' lists: the length before the call.</summary>
     public double? LengthBeforeMm { get; init; }
@@ -145,7 +147,7 @@ public sealed record SketchPatternRequest
 /// counts) and checks its intent on the geometry; when SOLIDWORKS changed something that fails the check, the change is
 /// undone (IModelDoc2.EditUndo2) and the error says whether the sketch is back to where it was.
 /// </summary>
-public sealed class SketchEditService(SwSession session)
+public sealed partial class SketchEditService(SwSession session)
 {
     private const double Tol = 1e-7;        // m: geometry comparisons (0.0001 mm)
     private const double AngTol = 1e-6;     // rad
@@ -1791,7 +1793,7 @@ public sealed class SketchEditService(SwSession session)
 
     /// <summary>Geometry of one segment (sketch coordinates in m; model coordinates in a 3D sketch).</summary>
     private sealed record Geo(string Kind, Vec3 Start, Vec3 End, Vec3 Center, double Radius, double Length, bool Construction,
-        bool HasEnds, int Dir = 1, double Major = 0, double Minor = 0, string? Text = null)
+        bool HasEnds, int Dir = 1, double Major = 0, double Minor = 0, string? Text = null, Vec3[]? FitPoints = null)
     {
         /// <summary>The point that follows the segment through a pattern or mirror: the center of round segments, else the mid point.</summary>
         public Vec3 Anchor => Kind switch
@@ -1835,10 +1837,11 @@ public sealed class SketchEditService(SwSession session)
             }
             case (int)swSketchSegments_e.swSketchSPLINE when s is ISketchSpline sp:
             {
-                var pts = sp.SkFitPoints();
-                var a = pts.Count > 0 ? V(pts[0]) : Vec3.Zero;
-                var b = pts.Count > 0 ? V(pts[^1]) : Vec3.Zero;
-                return new Geo("spline", a, b, (a + b) / 2, 0, len, cons, pts.Count > 0);
+                var pts = sp.SkFitPoints().Select(V).ToArray();
+                var a = pts.Length > 0 ? pts[0] : Vec3.Zero;
+                var b = pts.Length > 0 ? pts[^1] : Vec3.Zero;
+                var fit = !sp.IsStyleSpline && pts.Length > 0 && pts.Length == sp.GetPointCount() ? pts : null;
+                return new Geo("spline", a, b, (a + b) / 2, 0, len, cons, pts.Length > 0, FitPoints: fit);
             }
             case (int)swSketchSegments_e.swSketchTEXT:
             {
@@ -1889,7 +1892,11 @@ public sealed class SketchEditService(SwSession session)
 
     private static bool SameGeo(Geo a, Geo b) =>
         a.Kind == b.Kind && a.Construction == b.Construction && a.Start.DistanceTo(b.Start) < Tol && a.End.DistanceTo(b.End) < Tol &&
-        a.Center.DistanceTo(b.Center) < Tol && Math.Abs(a.Radius - b.Radius) < Tol && Math.Abs(a.Length - b.Length) < Tol;
+        a.Center.DistanceTo(b.Center) < Tol && Math.Abs(a.Radius - b.Radius) < Tol && Math.Abs(a.Length - b.Length) < Tol &&
+        SamePoints(a.FitPoints, b.FitPoints);
+
+    private static bool SamePoints(IReadOnlyList<Vec3>? a, IReadOnlyList<Vec3>? b) =>
+        a is null ? b is null : b is not null && a.Count == b.Count && a.Zip(b).All(p => p.First.DistanceTo(p.Second) < Tol);
 
     /// <summary>
     /// Undoes the last operation with IModelDoc2.EditUndo2(1) and checks that the sketch is back to <paramref name="before"/>.
@@ -1951,6 +1958,7 @@ public sealed class SketchEditService(SwSession session)
         RadiusMm = g.Kind is "arc" or "circle" ? Units.Mm(g.Radius) : null,
         MajorRadiusMm = g.Kind == "ellipse" ? Units.Mm(g.Major) : null,
         MinorRadiusMm = g.Kind == "ellipse" ? Units.Mm(g.Minor) : null,
+        FitPointsMm = g.FitPoints?.Select(p => Pt(p, is3D)).ToArray(),
         LengthMm = g.Kind == "text" ? null : Units.Mm(g.Length),
         LengthBeforeMm = lengthBefore is double lb && Math.Abs(lb - g.Length) > Tol ? Units.Mm(lb) : null,
         Text = g.Text,
