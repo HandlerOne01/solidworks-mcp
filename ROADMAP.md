@@ -314,7 +314,7 @@ rarer feature types.
 |---|---|---|---|---|---|---|
 | T5.1 | Extrude end conditions | Up to vertex, up to surface, offset from surface, up to body, up to next; start offset or start from a surface; two directions with their own depths | The end face is coincident with (or at the offset from) its target, measured | 12 | P0 | 🟡 |
 | T5.2 | Contour selection | Extrude or cut chosen regions of a sketch with several loops (sketch regions and contours) | Volume = the selected regions' area × depth | 8 | P0 | ⬜ |
-| T5.3 | Thin features | `feature_extrude` supports centered thin bosses with a blind depth. Thin cuts, revolutions, sweeps and lofts remain open. | Wall thickness by ray cast equals t | 10 | P1 | 🟡 |
+| T5.3 | Thin features | `feature_extrude` supports centered thin bosses and cuts with a blind depth. Other wall modes, thin revolutions, sweeps and lofts remain open. | Wall thickness by ray cast equals t | 10 | P1 | 🟡 |
 | T5.4 | Edit feature definitions | A `feature_edit` tool: change an existing extrude's end condition, a fillet's edges or radius, a pattern's count and seed, a hole's type and size, through `IFeatureData` + `ModifyDefinition` | Each edit rebuilds without errors and the geometry shows the change; a failed edit is undone | 24 | P0 | ⬜ |
 | T5.5 | Reorder features | `IModelDocExtension.ReorderFeature` with the dependency check | The tree order reads back; the volume is unchanged where the order doesn't matter | 6 | P1 | ⬜ |
 | T5.6 | Table-driven patterns | `InsertTableDrivenPattern2` with X/Y points from a coordinate system | Instances at the table's points | 8 | P1 | ⬜ |
@@ -350,13 +350,14 @@ rarer feature types.
 
 ## T6 · Surfaces and freeform
 Extrude, revolve, planar, offset, fill, knit, thicken, trim, extend and untrim work. Surface sweep supports a 2D
-profile and an open path. Surface loft supports ordered sketch profiles and guides.
+profile and an open path. Surface loft supports ordered sketch profiles and guides. A boundary surface supports two
+open sketch curves in each direction.
 
 | ID | Item | Approach (API) | Done when | h | P | State |
 |---|---|---|---|---|---|---|
 | T6.1 | Swept surfaces | `surface_sweep` uses `CreateDefinition(swFmRefSurface)`. Guides and closed paths remain open. | Area = profile length × path length for a straight normal sweep | 6 | P1 | 🟡 |
 | T6.2 | Lofted surfaces | `surface_loft` uses `InsertLoftRefSurface2` with guides | Its faces pass through every profile | 6 | P1 | ✅ |
-| T6.3 | Boundary surfaces | Probe the native boundary surface API and its directional selection groups | A surface through its curves in both directions | 8 | P2 | 🔬 |
+| T6.3 | Boundary surfaces | `surface_boundary` uses `InsertNetBlend2` for two open sketch curves in each direction. Edge inputs and continuity controls remain open. | A surface through its curves in both directions | 8 | P2 | 🟡 |
 | T6.4 | Ruled surfaces | `InsertRuledSurfaceFromEdge2` (tangent, normal, tapered, sweep) | Width and angle measured from the edge | 6 | P2 | ⬜ |
 | T6.5 | Mid-surfaces | `InsertMidSurface` from face pairs (for shell meshes) | The mid faces at half the thickness | 6 | P1 | ⬜ |
 | T6.6 | Flatten surfaces | `InsertFlattenSurface2` (developed blanks of curved panels) | A cylinder segment flattens to its developed area | 8 | P2 | ⬜ |
@@ -690,7 +691,7 @@ What was tried, why it failed and the next idea. Each has an item above.
 | Renders | PhotoView 360 is gone from 2025 | SOLIDWORKS Visualize | T18.1 |
 | Toolbox insertion | No API | Insert the master files and set the size | T9.24 |
 | Tooling split | `InsertMoldCoreCavitySolids` made nothing | SOLIDWORKS' example sequence | T14.2 |
-| Boundary surfaces | No API inserts one | Probe `CreateDefinition` | T6.3 |
+| Boundary surfaces | Directional selection marks depend on the selected entity type | `InsertNetBlend2` with ordered sketch selections | T6.3 |
 | Sensors | They can be read but not created | Read and edit only | T20.10 |
 | DFMXpress, Smart Fasteners | No API | In-server DFM checks (T15.1); `asm_fastener` | T15.1 |
 | Suspended VBA engine | No API reads its state | Window probes, a sentinel macro | T0.9 |

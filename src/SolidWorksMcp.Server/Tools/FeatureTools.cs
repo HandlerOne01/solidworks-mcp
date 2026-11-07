@@ -15,7 +15,7 @@ public sealed class FeatureTools(SwSession session)
 
     [McpServerTool(Name = "feature_extrude", Title = "Extrude (boss or cut)", ReadOnly = false, Destructive = false, Idempotent = false, OpenWorld = false)]
     [Description("Extrudes a closed sketch profile into a boss, or cuts it (cut=true). Uses the open/last sketch unless 'sketch' is given. " +
-                 "With thinThicknessMm, creates a centered thin-wall blind boss from an open or closed 2D sketch. " +
+                 "With thinThicknessMm, creates a centered thin-wall blind boss or thin cut from an open or closed 2D sketch. " +
                  "Verified: the feature exists without errors, the volume grew (boss) or shrank (cut), and the end cap lies at the requested depth; " +
                  "otherwise it is rolled back. Returns the feature, its dimensions (e.g. D1@Boss-Extrude1), the new faces with ids and the model extents.")]
     public Task<string> FeatureExtrude(
@@ -28,7 +28,7 @@ public sealed class FeatureTools(SwSession session)
         [Description("Merge the result with existing bodies (boss).")] bool merge = true,
         [Description("Draft angle in degrees (0 = none).")] double? draftDeg = null,
         [Description("Draft outward instead of inward.")] bool draftOutward = false,
-        [Description("Total thin-wall thickness in mm, centered on the profile. Blind boss only, without draft.")] double? thinThicknessMm = null,
+        [Description("Total thin-wall thickness or thin-cut width in mm, centered on the profile. Blind only, without draft.")] double? thinThicknessMm = null,
         [Description("Rename the new feature.")] string? name = null,
         [Description("Keep the feature even if verification fails (for diagnosis).")] bool keepOnFailure = false,
         [Description("Document (handle, title or path); default: the target document.")] string? doc = null,

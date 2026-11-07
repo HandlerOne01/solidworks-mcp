@@ -3,6 +3,7 @@ using SolidWorks.Interop.swconst;
 using SolidWorksMcp.Core.Com;
 using SolidWorksMcp.Core.Geometry;
 using SolidWorksMcp.Core.Model;
+using SolidWorksMcp.Core.Prefs;
 using SolidWorksMcp.Core.Verify;
 
 namespace SolidWorksMcp.Core.Services;
@@ -32,6 +33,7 @@ public sealed partial class FeatureService(SwSession session)
     private static readonly FeatureSpec BossSpec = new("feature_extrude", ["Extrusion", "ICE", "Boss", "BossThin"], VolumeRule.Increase);
     private static readonly FeatureSpec ThinBossSpec = BossSpec with { Types = ["ExtruThin", .. BossSpec.Types] };
     private static readonly FeatureSpec CutSpec = new("feature_extrude", ["Cut", "ICE", "CutThin"], VolumeRule.Decrease);
+    private static readonly FeatureSpec ThinCutSpec = CutSpec with { Types = ["CutThin"] };
     private static readonly FeatureSpec FilletSpec = new("feature_fillet", ["Fillet"], VolumeRule.Change);
 
     // ------------------------------------------------------------------ extrude
@@ -67,7 +69,11 @@ public sealed partial class FeatureService(SwSession session)
 
             var before = Snapshot.Take(d);
             if (thinThickness is not null)
-                CheckThinProfile(sketch, sketchFeat.Name, before.SolidBodies == 0);
+            {
+                if (q.Cut && before.SolidBodies == 0)
+                    throw SwException.InvalidArgument("A thin cut needs an existing solid body.");
+                CheckThinProfile(sketch, sketchFeat.Name, before.SolidBodies == 0, q.Cut);
+            }
             var s2m = SketchService.SketchToModel(sketch);
             var origin = s2m.ApplyPoint(Vec3.Zero);
             var normal = s2m.ApplyVector(Vec3.UnitX).Cross(s2m.ApplyVector(Vec3.UnitY)).Normalized();
@@ -87,6 +93,8 @@ public sealed partial class FeatureService(SwSession session)
             bool draft = q.DraftDeg is > 0;
             double draftRad = draft ? Units.Rad(q.DraftDeg!.Value) : 0;
 
+            using var thinCutPrefs = q.Cut && thinThickness is not null ? ctx.SystemPrefs() : null;
+            thinCutPrefs?.Toggle(SystemPrefIds.ShowErrorsEveryRebuild, false);
             try
             {
                 object? api;
@@ -99,10 +107,15 @@ public sealed partial class FeatureService(SwSession session)
                     if (thinThickness is double wall)
                     {
                         // Thk1 is the total thickness. SOLIDWORKS offsets half of it to each side in mid-plane mode.
-                        api = fm.FeatureExtrusionThin2(true, false, dirFlag, t1, t2, depth, 0,
-                            false, false, false, false, 0, 0, false, false, false, false, q.Merge,
-                            wall, 0, 0, (int)swThinWallType_e.swThinWallMidPlane, 0, false, 0,
-                            true, true, (int)swStartConditions_e.swStartSketchPlane, 0, false);
+                        api = q.Cut
+                            ? fm.FeatureCutThin2(true, false, dirFlag, t1, t2, depth, 0,
+                                false, false, false, false, 0, 0, false, false, false, false,
+                                wall, 0, 0, (int)swThinWallType_e.swThinWallMidPlane, 0, false, 0,
+                                true, true, (int)swStartConditions_e.swStartSketchPlane, 0, false)
+                            : fm.FeatureExtrusionThin2(true, false, dirFlag, t1, t2, depth, 0,
+                                false, false, false, false, 0, 0, false, false, false, false, q.Merge,
+                                wall, 0, 0, (int)swThinWallType_e.swThinWallMidPlane, 0, false, 0,
+                                true, true, (int)swStartConditions_e.swStartSketchPlane, 0, false);
                     }
                     else
                     {
@@ -120,7 +133,7 @@ public sealed partial class FeatureService(SwSession session)
                     d.ClearSelection2(true);
                 }
 
-                var spec = thinThickness is not null ? ThinBossSpec : q.Cut ? CutSpec : BossSpec;
+                var spec = thinThickness is null ? (q.Cut ? CutSpec : BossSpec) : (q.Cut ? ThinCutSpec : ThinBossSpec);
                 var o = FeatureVerifier.Check(ctx, d, before, spec,
                     (main, after, checks) => ExtrudeIntent(main, end, depth, origin, dirModel, q.Cut, checks, thinThickness),
                     q.KeepOnFailure, api);
@@ -131,7 +144,13 @@ public sealed partial class FeatureService(SwSession session)
             }
             catch (Exception ex) when (thinThickness is not null && !q.KeepOnFailure && !ComArgs.IsDisconnect(ex))
             {
-                BodyKit.CleanUp(ctx, d, before);
+                if (!q.Cut) BodyKit.CleanUp(ctx, d, before);
+                else if (!BodyKit.NothingNew(d, before))
+                {
+                    string rollback = FeatureVerifier.Rollback(ctx, d, before);
+                    throw new SwException((ex as SwException)?.Code ?? ErrorCodes.FeatureFailed, $"{ex.Message} {rollback}",
+                        (ex as SwException)?.Hint, ex);
+                }
                 throw;
             }
         }, RunOptions.Write(q.Doc), ct);
@@ -140,18 +159,19 @@ public sealed partial class FeatureService(SwSession session)
     {
         if (q.ThinThicknessMm is not double thickness) return null;
         double meters = Units.PositiveM(thickness, "thinThicknessMm");
-        if (q.Cut || end != "blind" || q.DraftDeg is not (null or 0))
-            throw SwException.InvalidArgument("'thinThicknessMm' supports blind bosses without draft.");
+        if (end != "blind" || q.DraftDeg is not (null or 0))
+            throw SwException.InvalidArgument("'thinThicknessMm' supports blind bosses and cuts without draft.");
         return meters;
     }
 
-    private static void CheckThinProfile(ISketch sketch, string name, bool isBase)
+    private static void CheckThinProfile(ISketch sketch, string name, bool isBase, bool cut)
     {
         if (sketch.Is3D()) throw SwException.InvalidArgument("A thin extrusion needs a 2D sketch.");
         int open = 0, closed = 0;
-        int usage = isBase ? (int)swSketchCheckFeatureProfileUsage_e.swSketchCheckFeature_BASEEXTRUDETHIN
-            : (int)swSketchCheckFeatureProfileUsage_e.swSketchCheckFeature_BOSSEXTRUDETHIN;
-        int status = sketch.CheckFeatureUse(usage, ref open, ref closed);
+        var usage = cut ? swSketchCheckFeatureProfileUsage_e.swSketchCheckFeature_CUTEXTRUDETHIN
+            : isBase ? swSketchCheckFeatureProfileUsage_e.swSketchCheckFeature_BASEEXTRUDETHIN
+            : swSketchCheckFeatureProfileUsage_e.swSketchCheckFeature_BOSSEXTRUDETHIN;
+        int status = sketch.CheckFeatureUse((int)usage, ref open, ref closed);
         if (status != (int)swSketchCheckFeatureStatus_e.swSketchCheckFeatureStatus_OK || open + closed == 0)
             throw SwException.InvalidArgument($"Sketch '{name}' is not a valid thin extrusion profile ({(swSketchCheckFeatureStatus_e)status}).",
                 "Use one open chain or a closed contour in a 2D sketch.");
@@ -186,11 +206,14 @@ public sealed partial class FeatureService(SwSession session)
             yield return "the result is not a centered thin extrusion";
             yield break;
         }
-        const double wallTolerance = 1e-6; // m
+        if (cut && (data.IsBossFeature() || data.BothDirections || data.GetEndCondition(true) != (int)swEndConditions_e.swEndCondBlind
+            || !(Math.Abs(data.GetDepth(true) - depth) <= Math.Min(1e-6, depth * 0.001))))
+            yield return "the thin cut definition did not read back as a single-direction blind cut at the requested depth";
+        double wallTolerance = cut ? Math.Min(1e-6, wall * 0.001) : 1e-6; // m
         double forward = data.GetWallThickness(true);
         if (Math.Abs(forward - wall) <= wallTolerance
             || (Math.Abs(forward - wall / 2) <= wallTolerance && Math.Abs(data.GetWallThickness(false) - wall / 2) <= wallTolerance))
-            checks.Add($"centered thin wall of {Units.Mm(wall)} mm");
+            checks.Add(cut ? $"centered thin cut {Units.Mm(wall)} mm wide" : $"centered thin wall of {Units.Mm(wall)} mm");
         else
             yield return $"wall thickness did not read back as {Units.Mm(wall)} mm";
     }

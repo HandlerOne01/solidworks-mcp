@@ -939,7 +939,7 @@ What changes the plan:
   (√(100² + 50²)), a dome within 0.01 % of its spherical cap, a deboss wrapped on a cylinder ((θ/2)(R² − (R − t)²)·h)
   and an indent cut removing exactly the overlap. Left out: flex (`InsertFlexFeature` makes a feature only with the body
   on mark 1, but its "twist" grew a bar's volume by 20 % and bulged its section, so its parameters can't be verified)
-  and boundary surfaces (no API). Found on the way: `body_list` reported sheet bodies' areas from `MassOfBody`, which is
+  and boundary surfaces (added later with `InsertNetBlend2`). Found on the way: `body_list` reported sheet bodies' areas from `MassOfBody`, which is
   wrong for them (320 000 mm² for a 100 × 60 sheet); they now sum their faces.
 
 **M9 WP3 · Manufacturability and mold tools** (M–L, ✅ 2026-10-31)
