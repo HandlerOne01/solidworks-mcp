@@ -89,6 +89,10 @@ internal static class ComArgs
             0x800706BF /*RPC_S_CALL_FAILED_DNE*/ or 0x80010007 /*RPC_E_SERVER_DIED*/ or 0x80010012 /*RPC_E_SERVER_DIED_DNE*/ or
             0x800401FD /*CO_E_OBJNOTCONNECTED*/ or 0x80010114 /*RPC_E_INVALID_OBJECT*/;
 
+    /// <summary>On the application itself, an unknown RPC interface also means this proxy can no longer be used.</summary>
+    internal static bool IsApplicationDisconnect(Exception ex) =>
+        IsDisconnect(ex) || ex is COMException ce && (uint)ce.HResult == 0x800706B5; // RPC_S_UNKNOWN_IF
+
     /// <summary>True for "the call was rejected because SOLIDWORKS is busy" (after the message filter gave up).</summary>
     public static bool IsRejected(Exception ex) =>
         ex is COMException ce && (uint)ce.HResult is 0x80010001 /*RPC_E_CALL_REJECTED*/ or 0x8001010A /*RPC_E_SERVERCALL_RETRYLATER*/;

@@ -261,9 +261,21 @@ public sealed class SwSession : IDisposable
             app = Launch();
         }
 
+        int attachedPid;
+        string revision;
+        try
+        {
+            attachedPid = app.GetProcessID();
+            revision = app.RevisionNumber();
+        }
+        catch (Exception ex) when (ComArgs.IsApplicationDisconnect(ex))
+        {
+            throw new SwException(ErrorCodes.NotConnected, "SOLIDWORKS registered a COM endpoint that is no longer responding.",
+                "Wait for SOLIDWORKS to finish starting or restarting, then retry sw_connect.", ex);
+        }
         _app = app;
-        _pid = app.GetProcessID();
-        _revision = app.RevisionNumber();
+        _pid = attachedPid;
+        _revision = revision;
         try { Interlocked.Exchange(ref _mainHwnd, ((IFrame)(object)app.Frame()).GetHWndx64()); }
         catch { Interlocked.Exchange(ref _mainHwnd, 0); }
         _attached = true;
@@ -279,7 +291,7 @@ public sealed class SwSession : IDisposable
         return app;
     }
 
-    /// <summary>False only when the instance is gone (disconnect errors); "busy" rejections propagate to the caller.</summary>
+    /// <summary>False when the application proxy is unusable; busy rejections propagate to the caller.</summary>
     private static bool IsAlive(ISldWorks app)
     {
         try
@@ -287,7 +299,7 @@ public sealed class SwSession : IDisposable
             _ = app.RevisionNumber();
             return true;
         }
-        catch (Exception ex) when (ComArgs.IsDisconnect(ex))
+        catch (Exception ex) when (ComArgs.IsApplicationDisconnect(ex))
         {
             return false;
         }
@@ -299,6 +311,7 @@ public sealed class SwSession : IDisposable
         if (_app is not null) _log.LogWarning("Detached from SOLIDWORKS (pid {Pid})", _pid);
         _app = null;
         _pid = 0;
+        _revision = null;
         Interlocked.Exchange(ref _mainHwnd, 0);
         _attached = false;
         Documents.Clear();
